@@ -18,10 +18,12 @@ from __future__ import annotations
 import ctypes
 import errno
 import os
+import shutil
 import signal
 import subprocess
 import sys
 import time
+from typing import Any
 
 try:  # repository layout
     from agent.sandbox import limits as limits_mod
@@ -39,6 +41,7 @@ MS_REMOUNT = 32
 RB_POWER_OFF = 0x4321FEDC
 MAX_EXECUTOR_RESTARTS = 3
 EXECUTOR = "/usr/lib/agent/sandbox/executor.py"
+WORKSPACE_DEVICE = "/dev/vdb"
 
 _poweroff_requested = False
 _child_exited = False
@@ -178,10 +181,39 @@ def _root_writable() -> bool:
         return False
 
 
+def grow_workspace_filesystem(device: str = WORKSPACE_DEVICE, run: Any = subprocess.run) -> str:
+    """Resize the workspace ext4 to the full device, before it is mounted.
+
+    The per-session overlay is backed by the image's blank workspace, so growing the disk
+    (`qemu-img resize var\\sandbox\\workspace-blank.qcow2 40G`) is enough for the next boot
+    to see the new size: the filesystem itself still thinks it is 20 GiB -- nothing in this
+    guest used to call ``resize2fs``, so the extra space was simply invisible.
+
+    Best effort by design: a missing ``resize2fs`` (or an already-full-size filesystem,
+    which ``resize2fs`` reports as a no-op) must never stop the sandbox from booting.
+    Returns a short status wording for the log.
+    """
+    if not os.path.exists(device):
+        return "no device"
+    tool = shutil.which("resize2fs")
+    if not tool:
+        return "resize2fs missing"
+    try:
+        completed = run([tool, device], check=False, capture_output=True, timeout=300)  # noqa: S603 - fixed argv
+    except (OSError, subprocess.SubprocessError) as exc:  # pragma: no cover - host dependent
+        return f"failed: {exc}"
+    if completed.returncode != 0:
+        detail = (completed.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        reason = detail[-1] if detail else f"exit {completed.returncode}"
+        return f"skipped: {reason}"
+    return "ok"
+
+
 def mount_workspace() -> None:
     uid, gid = limits_mod.sandbox_ids()
-    device = "/dev/vdb"
+    device = WORKSPACE_DEVICE
     if os.path.exists(device):
+        log(f"workspace filesystem resize to the full disk: {grow_workspace_filesystem(device)}")
         if mount(device, policy.WORKSPACE, "ext4", MS_NOSUID | MS_NODEV, "rw,errors=remount-ro"):
             log(f"workspace disk {device} mounted at {policy.WORKSPACE}")
         else:

@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -187,3 +189,93 @@ def test_the_build_script_targets_stay_in_sync_with_the_checker_and_the_console(
         assert module in checker.THIRD_PARTY_IMPORTS
     assert PIP_TARGET == "/workspace/pylibs"
     assert checker.THIRD_PARTY_IMPORTS  # the image list is documented in build-sandbox-image.sh
+
+
+# ------------------------------------------------------- the workspace disk size
+def _workspace_size_snippet() -> str:
+    """The size-resolution block of the build script, verbatim and runnable.
+
+    Everything it needs is the environment (the command-line override), ``$BASH_ENV`` (the
+    VM's .env) and this one .env variable, so a real ``bash`` can execute it directly --
+    the same trick the rest of this file uses to pin the image build.
+    """
+    source = BUILD_SCRIPT.read_text(encoding="utf-8")
+    start = source.index('WORKSPACE_SIZE_DEFAULT="')
+    end = source.index('echo "==> workspace disk:')
+    snippet = textwrap.dedent(source[start:end])
+    return snippet + 'printf "%s (source: %s)\\n" "${WORKSPACE_SIZE}" "${WORKSPACE_SIZE_SOURCE}"\n'
+
+
+def _bash() -> str | None:
+    """A real bash, if this host has one (the build script runs on Linux).
+
+    Git-for-Windows bash is a genuine bash and is used when ``which`` cannot see it, so the
+    precedence below is executed rather than merely grepped on a Windows development host.
+    """
+    if os.name == "posix":
+        return shutil.which("bash")
+    for candidate in (r"C:\Program Files\Git\bin\bash.exe", r"C:\Program Files\Git\usr\bin\bash.exe"):
+        if Path(candidate).is_file():
+            return candidate
+    return None
+
+
+def _resolve_workspace_size(tmp_path: Path, command_line: str = "") -> str:
+    """Resolve the workspace size exactly as the build script does, and return its report."""
+    bash = _bash()
+    if bash is None:
+        pytest.skip("the build script needs a bash; none is available on this host")
+    env = dict(os.environ)
+    env.pop("WORKSPACE_SIZE", None)
+    if os.name == "nt":  # make the grep/tail the snippet calls reachable from Git-bash
+        env["PATH"] = str(Path(bash).parent) + os.pathsep + env.get("PATH", "")
+    env["BASH_ENV"] = str(tmp_path / "bash_env").replace("\\", "/")  # the environment the VM would have
+    env["WORKSPACE_SIZE_ENV_FILE"] = str(tmp_path / ".env").replace("\\", "/")  # the VM's .env, stood in for
+    if command_line:
+        env["WORKSPACE_SIZE"] = command_line
+    completed = subprocess.run(  # noqa: S603 - fixed interpreter, test-owned snippet
+        [bash, "-c", _workspace_size_snippet()],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return completed.stdout.strip()
+
+
+def test_the_workspace_disk_precedence_is_command_line_then_env_file_then_default(tmp_path):
+    """Regression: a rebuild without WORKSPACE_SIZE silently shrank 20 GiB to 4 GiB."""
+    assert _resolve_workspace_size(tmp_path) == "20480M (source: default)"
+    (tmp_path / ".env").write_text(
+        "# the VM's .env shape: a comment, then the setting\nAGENT_SANDBOX_WORKSPACE_MB=20480\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    assert _resolve_workspace_size(tmp_path) == "20480M (source: .env (AGENT_SANDBOX_WORKSPACE_MB))"
+    assert _resolve_workspace_size(tmp_path, command_line="4096M") == "4096M (source: command line)"
+    source = BUILD_SCRIPT.read_text(encoding="utf-8")
+    assert "e2fsprogs" in source, "the guest needs resize2fs to use a grown disk"
+
+
+def test_growing_the_workspace_filesystem_is_idempotent_and_never_fatal(monkeypatch, tmp_path):
+    from agent.sandbox import init
+
+    device = tmp_path / "vdb"
+    device.write_bytes(b"\x00" * 16)
+    monkeypatch.setattr(init.shutil, "which", lambda _name: "/sbin/resize2fs")
+    calls: list[list[str]] = []
+
+    def already_full_size(argv, **_kwargs):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 1, b"", b"The filesystem is already 20971520 (4k) blocks long.\n")
+
+    verdict = init.grow_workspace_filesystem(str(device), already_full_size)
+
+    assert calls == [["/sbin/resize2fs", str(device)]], "called once per boot, with the workspace device"
+    assert verdict.startswith("skipped:"), "an already-full filesystem is logged, not raised"
+    assert init.grow_workspace_filesystem(str(tmp_path / "absent"), already_full_size) == "no device"
+    monkeypatch.setattr(init.shutil, "which", lambda _name: None)
+    assert init.grow_workspace_filesystem(str(device), already_full_size) == "resize2fs missing"
+    assert len(calls) == 1, "a missing resize2fs must not run anything"

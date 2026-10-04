@@ -26,8 +26,12 @@ MIRROR="${MIRROR:-http://mirrors.tuna.tsinghua.edu.cn/debian}"
 ARCH="${ARCH:-amd64}"
 OUT="${OUT:-/var/lib/agentbox/sandbox}"
 ROOTFS_SIZE="${ROOTFS_SIZE:-1400M}"
-# 4 GiB by default: builds, package installs and datasets need room.
-WORKSPACE_SIZE="${WORKSPACE_SIZE:-4096M}"
+# 20 GiB by default: builds, package installs and datasets need room.  This used to be
+# 4096M and a rebuild *without* the variable silently replaced the operator's 20 GiB disk
+# with a 4 GiB one.  Resolution order is command line > the VM's .env > this default, and
+# the resolved value is printed below so it can never be silent again.
+WORKSPACE_SIZE="${WORKSPACE_SIZE:-}"
+WORKSPACE_SIZE_DEFAULT="20480M"
 SANDBOX_UID="${SANDBOX_UID:-1000}"
 SANDBOX_GID="${SANDBOX_GID:-1000}"
 
@@ -58,6 +62,52 @@ PERSISTED_PIP="${AGENT_SANDBOX_EXTRA_PIP:-${PERSISTED_PIP:-}}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 GUEST_SRC="${REPO_DIR}/src/agent/sandbox"
+
+# ---------------------------------------------------------------------------
+# Workspace disk size: command line > the VM's .env > 20480M.
+#
+# The .env in the platform VM is where the console's /pip persist writes
+# AGENT_SANDBOX_EXTRA_PIP, and it is readable here for the same reason (the build runs
+# inside that VM, normally as /opt/agentbox/app/deploy/sandbox/build-sandbox-image.sh).
+# Read with `sudo grep` so the 0640 root-owned .env is still readable when an operator
+# runs the build as a plain user, then `eval` only the assignment the grep printed.
+# `WORKSPACE_SIZE_REQUESTED` keeps the command line authoritative.
+# ---------------------------------------------------------------------------
+WORKSPACE_SIZE_REQUESTED="${WORKSPACE_SIZE}"
+WORKSPACE_SIZE_ENV_FILE="${WORKSPACE_SIZE_ENV_FILE:-${REPO_DIR}/.env}"
+if [[ -n "${WORKSPACE_SIZE_REQUESTED}" ]]; then
+  WORKSPACE_SIZE_SOURCE="command line"
+else
+  WORKSPACE_SIZE_SOURCE="default"
+  if [[ -f "${WORKSPACE_SIZE_ENV_FILE}" ]]; then
+    WS_PATTERN='^[[:space:]]*(export[[:space:]]+)?AGENT_SANDBOX_WORKSPACE_MB='
+    if WORKSPACE_SIZE_ENV_SETTING="$(grep -hE "${WS_PATTERN}" "${WORKSPACE_SIZE_ENV_FILE}" | tail -n1)"; then
+      :
+    else
+      # a 0640 root-owned .env when the build runs as a plain user (stderr is left alone
+      # on purpose: a missing sudo should be visible, not swallowed)
+      WORKSPACE_SIZE_ENV_SETTING="$(sudo grep -hE "${WS_PATTERN}" "${WORKSPACE_SIZE_ENV_FILE}" | tail -n1)"
+    fi
+    if [[ -n "${WORKSPACE_SIZE_ENV_SETTING}" ]]; then
+      eval "WORKSPACE_SIZE_ENV_SETTING=${WORKSPACE_SIZE_ENV_SETTING#*=}"
+      if [[ -n "${WORKSPACE_SIZE_ENV_SETTING}" ]]; then
+        # AGENT_SANDBOX_WORKSPACE_MB is a *megabyte count*, so a bare 20480 means 20480M
+        if [[ ! "${WORKSPACE_SIZE_ENV_SETTING}" =~ [MmGgTtKk]$ ]]; then
+          WORKSPACE_SIZE_ENV_SETTING="${WORKSPACE_SIZE_ENV_SETTING}M"
+        fi
+        WORKSPACE_SIZE="${WORKSPACE_SIZE_ENV_SETTING}"
+        WORKSPACE_SIZE_SOURCE=".env (AGENT_SANDBOX_WORKSPACE_MB)"
+      fi
+    fi
+  fi
+  : "${WORKSPACE_SIZE:=${WORKSPACE_SIZE_DEFAULT}}"
+fi
+WS_BYTES="$(printf '%s' "${WORKSPACE_SIZE}" | grep -oE '^[0-9]+')"
+WS_WARNING=""
+if [[ -n "${WS_BYTES}" ]] && (( WS_BYTES < 8192 )); then
+  WS_WARNING=" [WARNING: smaller than 8 GiB]"
+fi
+echo "==> workspace disk: ${WORKSPACE_SIZE} (source: ${WORKSPACE_SIZE_SOURCE})${WS_WARNING}"
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "must run as root (debootstrap + chroot); try: sudo $0" >&2
@@ -99,8 +149,12 @@ apt-get install -y -qq --no-install-recommends debootstrap e2fsprogs qemu-utils 
 echo "==> debootstrap ${SUITE}/${ARCH} into ${ROOTFS}"
 # python3-minimal has a stripped stdlib (no ctypes/shutil/threading), which made
 # PID 1 die with "No module named ctypes" and panic the kernel: use the full package.
+# e2fsprogs: the guest resizes /workspace to the full device on every boot (init.py
+# `grow_workspace_filesystem`), so `qemu-img resize workspace-blank.qcow2 40G` is enough
+# to get a bigger workspace without rebuilding the image.  It also gives the build its
+# mkfs.ext4/debugfs.
 INCLUDE="python3,python3-pip,python3-venv,passwd,kmod,initramfs-tools,linux-image-${ARCH},util-linux,coreutils,bash,\
-procps,findutils,grep,sed,gawk,tar,gzip,xz-utils,file,diffutils,patch,less,nftables,iproute2,\
+e2fsprogs,procps,findutils,grep,sed,gawk,tar,gzip,xz-utils,file,diffutils,patch,less,nftables,iproute2,\
 iputils-ping,ca-certificates"
 # debootstrap has no download timeout: a single stalled connection hangs the
 # whole build forever (seen in practice).  Bound each attempt and fall back.
@@ -427,6 +481,7 @@ install -d -o "${SANDBOX_UID}" -g "${SANDBOX_GID}" -m 0755 "${WS_DIR}/.tools"
 rm -f "${BUILD}/workspace.raw" "${OUT}/workspace-blank.qcow2"
 mkfs.ext4 -q -O ^has_journal -L agentbox-ws -d "${WS_DIR}" -F "${BUILD}/workspace.raw" "${WORKSPACE_SIZE}"
 qemu-img convert -f raw -O qcow2 "${BUILD}/workspace.raw" "${OUT}/workspace-blank.qcow2"
+qemu-img info "${OUT}/workspace-blank.qcow2" | sed 's/^/  /'
 
 echo "==> copying kernel and initramfs"
 cp -f "${KERNEL}" "${OUT}/vmlinuz"
