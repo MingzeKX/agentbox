@@ -315,11 +315,17 @@ else
   read -r -a PACKAGE_LIST <<< "${PACKAGES}"
   PIP_PACKAGES="${PACKAGE_LIST[*]}"
 
-  # The run-time /etc/resolv.conf is a symlink into /run (see below) and the build
-  # copied the host's resolver early on; make sure it is still a real file for pip.
+  # The hardening phase already replaced /etc/resolv.conf with the run-time symlink into
+  # /run (which has no resolver during the build), so materialise a real file for pip and
+  # re-create the symlink immediately afterwards -- forgetting that is how the guest ends up
+  # unable to write its DNS config in net mode.
   if [[ ! -s "${ROOTFS}/etc/resolv.conf" ]]; then
     rm -f "${ROOTFS}/etc/resolv.conf"
     cp -f /etc/resolv.conf "${ROOTFS}/etc/resolv.conf" 2>/dev/null || true
+  fi
+  if [[ ! -s "${ROOTFS}/etc/resolv.conf" ]]; then
+    echo "!!! the chroot has no resolver config; pip cannot reach ${PIP_INDEX_URL}" >&2
+    exit 1
   fi
 
   if ! chroot "${ROOTFS}" env DEBIAN_FRONTEND=noninteractive \
@@ -374,6 +380,16 @@ PY
     | cut -f1 > "${BUILD}/rootfs-size-after-pip"
 fi
 
+# The pip step runs with a real /etc/resolv.conf (see the note there).  Whatever happened
+# above, the image MUST ship the run-time symlink into /run: / is read-only in the guest, so
+# a regular file here means the sandbox can never write its DNS config in net mode.
+rm -f "${ROOTFS}/etc/resolv.conf"
+ln -s /run/agent/resolv.conf "${ROOTFS}/etc/resolv.conf"
+if [[ ! -L "${ROOTFS}/etc/resolv.conf" ]]; then
+  echo "!!! /etc/resolv.conf is not a symlink; the guest could not write its DNS config" >&2
+  exit 1
+fi
+
 # 用与真实运行完全相同的方式导入：guest 里是 `python3 /usr/lib/agent/sandbox/xxx.py`
 # （脚本目录自动进 sys.path），所以这里导入同级模块，而不是 sandbox.* 包路径。
 if ! chroot "${ROOTFS}" /usr/bin/python3 - <<'PY'
@@ -422,6 +438,15 @@ cp -f "${KERNEL}" "${OUT}/vmlinuz"
 cp -f "${INITRD}" "${OUT}/initrd.img"
 
 echo "==> verifying the produced image"
+# Regression guard for a bug this script already had: the pip step runs with a real
+# /etc/resolv.conf, and if the run-time symlink is not put back the guest silently loses the
+# ability to write its DNS config (the root is read-only, so a regular file can never be
+# updated).  Cheap to check here; impossible to notice from a green build otherwise.
+if ! debugfs -R "stat /etc/resolv.conf" "${OUT}/rootfs.img" 2>/dev/null | grep -q "Type: symlink"; then
+  echo "!!! /etc/resolv.conf in rootfs.img is not a symlink" >&2
+  exit 1
+fi
+echo "  /etc/resolv.conf is a symlink in the image"
 # Evidence for the "third-party imports work" claim: what the packages cost in the
 # very tree rootfs.img is built from.
 if [[ -s "${BUILD}/rootfs-size-before-pip" && -s "${BUILD}/rootfs-size-after-pip" ]]; then
