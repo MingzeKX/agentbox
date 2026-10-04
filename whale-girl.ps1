@@ -46,7 +46,7 @@ param(
     [int]$ControlPort = 8091,
     # 用法说明。注意：`-?` 这个名字在 Windows PowerShell 5.1 里会被 PowerShell 自己
     # 吃掉（实测连脚本都不加载，直接报"无法加载文件"），所以它只是别名之一；
-    # 可靠写法是 -Usage / -Help / -h，或者干脆不带任何参数。
+    # 可靠写法是 -Usage / -Help / -h；不带任何参数 = 直接启动（默认文字对话）。
     [Alias('h', '?')][switch]$Usage,
     [switch]$Help
 )
@@ -67,7 +67,7 @@ function Show-Usage {
     Write-Host '    -Message "…"        非交互跑一轮就退出'
     Write-Host '    -NoStart            不自动启服务（服务没跑就直接报错）'
     Write-Host '    -Persona <名字>      换人格，默认 whale'
-    Write-Host '    -Usage / -Help      本说明（不带任何参数也一样）'
+    Write-Host '    -Usage / -Help      本说明（不带参数 = 直接启动鲸鱼娘管家）'
     Write-Host ''
     Write-Host '  例：.\whale-girl.ps1 -Message "在沙箱里跑 uname -a"' -ForegroundColor DarkGray
     Write-Host '  例：.\whale-girl.ps1 -Voice -NoSpeak' -ForegroundColor DarkGray
@@ -75,7 +75,7 @@ function Show-Usage {
 }
 
 # 不带参数 = 只想看用法（不会去启动 VM / 服务，这点很重要）。
-if ($Usage -or $Help -or $PSBoundParameters.Count -eq 0) {
+if ($Usage -or $Help) {
     Show-Usage
     exit 0
 }
