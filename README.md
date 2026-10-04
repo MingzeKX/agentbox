@@ -711,3 +711,42 @@ QEMU argv 的 12 项安全断言、AI 服务隔离守卫。
   `iso_extract.py` 只解析 ISO9660 主卷描述符，对非 Debian 的异构 ISO 可能找不到安装器内核。
 * 不做多模态、不做 Web UI、不做工具市场/签名分发、不做 GPU 直通。
 * `py.run` 的结果上限 1 MiB，大结果必须由工具写进 `/workspace` 再让模型用 `fs.read` 分段取。
+
+---
+
+## 附：打包 / 搬到另一台 Windows 机器（`packaging\`）
+
+> 本节由打包工作新增（只追加，不改上文）。细节和实测数字都在 [`packaging/README.md`](packaging/README.md)。
+
+`packaging\` 下三个脚本：
+
+| 脚本 | 什么时候跑 | 作用 |
+| --- | --- | --- |
+| `make-bundle.ps1` | 源机器 | 打包成 `dist\agentbox-<版本>-<时间>[-lean|-fat].zip`，附 `MANIFEST.sha256` + `SOURCE-COMMIT.txt` |
+| `setup-agentbox.ps1` | 目标机器 | **一键**：预检 → `.venv` + 依赖（有 wheelhouse 就全离线）→ `.env` → 平台 VM → 模型 → 起服务自检 → `已就绪/未就绪` |
+| `install.ps1` | 目标机器 | 只做 Windows 侧：`.venv` + 依赖 + `.env` + 体检（`-Check`） |
+
+实测体积（2026-10，agentbox 0.1.0）：代码包 **494.9 KB**；`-Lean`（+ wheelhouse 37 MB +
+精简 QEMU 210 MB + 沙箱镜像 1.42 GB）**1.52 GB**；`-Fat`（+ 平台磁盘 10.64 GB + ISO 756 MB）**~13 GB**。
+
+搬到新机器的两条命令：
+
+```powershell
+Expand-Archive .\agentbox-0.1.0-<stamp>-lean.zip -DestinationPath C:\agentbox
+cd C:\agentbox
+powershell -ExecutionPolicy Bypass -File .\packaging\setup-agentbox.ps1 -Check   # 先体检（不改动）
+powershell -ExecutionPolicy Bypass -File .\packaging\setup-agentbox.ps1 -Yes     # 一键装
+```
+
+之后只需要：把 DeepSeek key 填进 `.env` 的 `AGENT_LLM_API_KEY=`，然后
+`powershell -ExecutionPolicy Bypass -File .\deploy\windows\start-agent.ps1`。
+
+**打包协议（硬要求）**：`make-bundle.ps1` 只在**工作树干净**时打包（`git status --porcelain`
+里不能有 tracked 改动、`src/tests/deploy` 下不能有未跟踪文件），否则中止并列出问题 ——
+防止"另一个代理正在改源码，包里那份和仓库对不上"。包内三处记录来源 commit：
+`SOURCE-COMMIT.txt`（包根）、`BUNDLE-README.md` 顶部、`MANIFEST.sha256` 头部注释。
+`-DryRun` 可以只复核打包结果而不产出 zip。
+
+**离线覆盖不到**：Python 解释器本身、QEMU、`var\vm_key`（SSH 私钥，永不进包）、
+平台 VM 的安装期联网（apt/pip）、以及只能在 Linux/VM 内构建的沙箱镜像。
+

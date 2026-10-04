@@ -1,0 +1,6 @@
+# 打包产物与本地产物，不进版本库
+wheelhouse/
+dist/
+_staging-*/
+*.zip
+*.zip.sha256
