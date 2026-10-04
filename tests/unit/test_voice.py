@@ -776,11 +776,17 @@ def test_voice_loop_does_not_speak_when_tts_is_off(monkeypatch):
 
 
 def test_voice_loop_uses_the_module_transcriber_and_speaker(monkeypatch):
-    """The defaults are the real functions: monkeypatching them is enough to test them."""
+    """The defaults are the real functions, resolved late: monkeypatching them is enough.
+
+    The answer is spoken through ``say_with_barge_in`` (the interruptible speaker), not
+    through the blocking ``speak`` -- that is the whole point of barge-in.
+    """
     monkeypatch.setattr(settings, "voice_tts", True)
     monkeypatch.setattr(voice_module, "transcribe", transcriber("模块识别"))
     spoken: list[str] = []
-    monkeypatch.setattr(voice_module, "speak", lambda text, console=None: spoken.append(text) or True)
+    monkeypatch.setattr(
+        voice_module, "say_with_barge_in", lambda text, console=None: spoken.append(text) or False
+    )
     answered: list[str] = []
 
     voice_loop(
@@ -790,8 +796,8 @@ def test_voice_loop_uses_the_module_transcriber_and_speaker(monkeypatch):
         recorder=FakeRecorder([pack_wav(tone(100))]),
     )
 
-    assert answered == ["模块识别"]
-    assert spoken == ["回答内容"]
+    assert answered == ["模块识别"], "the default transcriber is voice.transcribe, looked up late"
+    assert spoken == ["回答内容"], "the default speaker is voice.say_with_barge_in, looked up late"
 
 
 def test_voice_loop_keeps_going_when_speech_is_unavailable(monkeypatch):
@@ -827,15 +833,27 @@ class FakeKeyboard:
 
 
 class FakeSpeechProcess:
-    """A SAPI process that only ever finishes when it is terminated (like a long answer)."""
+    """A SAPI process that only ever finishes when it is terminated (like a long answer).
 
-    def __init__(self, code: int | None = None) -> None:
+    ``finish_after`` makes it exit by itself after that many ``poll()`` calls, which is what
+    a short answer does; the default (``None``) never finishes, which is what a long one
+    does until a keypress or the timeout kills it.
+    """
+
+    def __init__(self, code: int | None = None, *, finish_after: int | None = None) -> None:
         self.code = code
+        self.finish_after = finish_after
+        self.polls = 0
         self.terminated = 0
         self.waits = 0
 
     def poll(self) -> int | None:
-        return 1 if self.terminated else self.code
+        if self.terminated:
+            return 1
+        self.polls += 1
+        if self.finish_after is not None and self.polls >= self.finish_after:
+            return 0 if self.code is None else self.code
+        return self.code
 
     def terminate(self) -> None:
         self.terminated += 1
@@ -845,13 +863,16 @@ class FakeSpeechProcess:
         return 1
 
 
-def test_speech_handle_polls_until_the_utterance_ends():
-    process = FakeSpeechProcess(code=None)
+def test_speech_handle_polls_until_the_utterance_ends(monkeypatch):
+    # no key is ever pressed: this utterance ends by itself, so nothing may kill it
+    monkeypatch.setattr(voice_module, "any_key_pressed", lambda: False)
+    process = FakeSpeechProcess(finish_after=3)
     handle = SpeechHandle(process)
 
     assert handle.poll() is None, "still speaking"
     assert handle.wait(poll_s=0.001, timeout=0.05) is False, "it ended on its own"
     assert process.terminated == 0, "a finished utterance is never killed"
+    assert handle.poll() is False, "and the handle stays finished"
 
 
 def test_speech_handle_stops_the_process_and_reports_the_interruption(monkeypatch):
@@ -904,7 +925,12 @@ def test_speak_with_barge_in_never_runs_powershell_when_tts_is_off(monkeypatch):
 
 
 def test_voice_loop_space_is_text_and_never_starts_a_recording(monkeypatch):
-    """(a) a lone space must not record, not send, and not be swallowed."""
+    """(a) a lone space must not record and must not become a message either.
+
+    It is *text with nothing in it*: the plain prompt drops it (main.cmd_chat strips the
+    line and continues on empty), /help voice-mode promises "只按一下空格不会开始录音、
+    也不会发送", and only a genuinely empty line means "talk".
+    """
     monkeypatch.setattr(settings, "voice_tts", True)
     console = quiet_console()
     recorder = FakeRecorder([pack_wav(tone(100))])
@@ -920,7 +946,8 @@ def test_voice_loop_space_is_text_and_never_starts_a_recording(monkeypatch):
     )
 
     assert recorder.calls == 0, "a lone space is text, not a trigger"
-    assert answered == [" "], "the space is sent as the message it is"
+    assert answered == [], "whitespace-only text carries no message to send"
+    assert "已退出语音模式" in output(console), "the loop stayed alive and took the next line"
 
 
 def test_voice_loop_enter_on_an_empty_line_records_one_utterance(monkeypatch):
@@ -949,6 +976,7 @@ def test_voice_loop_enter_on_an_empty_line_records_one_utterance(monkeypatch):
 def test_voice_loop_talk_key_records_while_a_line_is_being_typed(monkeypatch):
     """The explicit binding (Ctrl+T) is a sentinel, so it can never be confused with text."""
     monkeypatch.setattr(settings, "voice_tts", False)
+    assert isinstance(TALK_SENTINEL, TalkKey), "the loop keys off isinstance, not a magic string"
     console = quiet_console()
     wav = pack_wav(tone(RATE // 2))
     recorder = FakeRecorder([wav])
@@ -984,6 +1012,8 @@ def test_voice_loop_prompt_lines_state_every_phase(monkeypatch):
     out = output(console)
 
     assert "按回车或 Ctrl+T 说话 · 输入 q 退出" in out, "the binding is printed in the prompt"
+    assert CONTINUE_PROMPT in out, "the prompt the loop prints is the shared constant"
+    assert TALK_KEY in out, "the prompt names the dedicated talk key, not just Enter"
     assert "🎤 录音中…（停顿 1.2 秒自动结束 / 按 Ctrl+C 取消）" in out
     assert "识别中…" in out
     assert spoken == ["回答内容"]
@@ -1062,7 +1092,8 @@ def test_voice_loop_tolerates_a_recorder_that_returns_a_bare_keypress(monkeypatc
     assert "没有听到声音" in output(console), "the sentinel started a recording, as intended"
 
 
-
+class FakeStream:
+    """The parts of a sounddevice input stream the recorder drives: open, read, close."""
 
     def __init__(self, blocks: list[bytes], error: Exception | None = None) -> None:
         self.blocks = list(blocks)
@@ -1281,7 +1312,10 @@ def no_sounddevice(monkeypatch):
 
 
 def output(console: Console) -> str:
-    return console.export_text()
+    # export_text() clears the record buffer by default, so the obvious two-line shape
+    # ("assert A in output(c); assert B in output(c)") would silently lose A.  Every
+    # caller here means "everything printed so far", so never clear.
+    return console.export_text(clear=False)
 
 
 def test_voice_mode_status_prints_chinese(shell):
@@ -1406,6 +1440,10 @@ def test_voice_help_is_discoverable_and_complete(shell):
     assert "/voice-mode hands-free" in text
     assert "麦克风" in text
     assert "q" in text and "退出" in text
+    # both talk keys the console actually binds (ctrl-t and f2 in main.build_console) are
+    # discoverable from the help text, so the operator never has to guess
+    assert TALK_KEY in text, "/help voice-mode names the primary talk key"
+    assert TALK_KEY_ALT in text, "/help voice-mode names the alternate talk key"
     sh.handle("/help speak")
     assert "SAPI" in output(console)
 

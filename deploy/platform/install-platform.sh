@@ -74,7 +74,10 @@ python3 -m venv "${VENV}"
 if [[ "${INSTALL_LOCAL_EMBED:-0}" == "1" ]]; then
   # CPU-only torch first: the default PyPI wheel bundles CUDA and is several GB
   # larger than anything this agent needs.
-  PYTORCH_INDEX="${PYTORCH_INDEX:-https://mirrors.aliyun.com/pytorch-wheels/cpu}"
+  # The aliyun CPU mirror has no cp313 wheels (measured: "Could not find a version that
+# satisfies the requirement torch") and the default PyPI wheel bundles CUDA (several GB),
+# so the official CPU index is the default.  Override with PYTORCH_INDEX=... if you like.
+PYTORCH_INDEX="${PYTORCH_INDEX:-https://download.pytorch.org/whl/cpu}"
   log "installing CPU-only torch from ${PYTORCH_INDEX}"
   "${VENV}/bin/pip" install torch --index-url "${PYTORCH_INDEX}"
   log "installing sentence-transformers"

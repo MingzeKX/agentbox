@@ -1002,7 +1002,9 @@ def voice_loop(
     * any keypress while the answer is being spoken stops the speech and goes back to
       listening (barge-in), instead of waiting for a long answer to be read out;
     * Ctrl-C *during a turn* cancels that turn and asks again; only Ctrl-C at the prompt
-      (or ``q``) leaves the mode, so one interrupted answer never ends the session.
+      (or ``q``) leaves the mode, so one interrupted answer never ends the session.  The
+      exception is hands-free mode, which has no prompt to ask again from: there Ctrl-C
+      while waiting for speech ends voice mode.
 
     Typing (instead of pressing Enter) sends that text as a normal message, so voice mode
     never traps the operator into a microphone-only interface.
@@ -1024,20 +1026,26 @@ def voice_loop(
         if not hands_free:
             # the talk key arrives as a sentinel, so a typed space can never mean "record"
             trigger = ask(CONTINUE_PROMPT)
-            if isinstance(trigger, TalkKey):
-                line = ""
-            else:
-                line = str(trigger).strip()
+            raw = "" if isinstance(trigger, TalkKey) else str(trigger)
+            line = raw.strip()
             if line.lower() in STOP_WORDS:
                 console.print("[dim]已退出语音模式[/dim]")
-                return "off"
+                return MODE_OFF
             if line.startswith("/"):
                 console.print(
                     "[yellow]语音模式下只认 q（退出）或直接输入文字；"
                     "其他命令请先用 q 退出语音模式[/yellow]"
                 )
                 continue
-            typed = line or None  # only a truly empty line means "record"
+            if line:
+                typed = line
+            elif raw:
+                # a lone space is text -- and whitespace-only text has nothing to send, so
+                # it is neither a trigger nor a message.  The plain prompt drops it the same
+                # way (main.cmd_chat), which is what makes the two prompts agree.
+                continue
+            else:
+                typed = None  # only a genuinely empty line means "talk"
 
         if typed is None:
             console.print(RECORDING_MESSAGE)
@@ -1049,6 +1057,12 @@ def voice_loop(
                 return "off"
             except KeyboardInterrupt:
                 console.print()
+                if hands_free:
+                    # Hands-free mode has no prompt to return to, so "cancel this recording
+                    # and ask again" would spin forever: leaving voice mode is the only
+                    # reading that gives Ctrl-C a meaning here.
+                    console.print("[dim]已退出语音模式[/dim]")
+                    return MODE_OFF
                 console.print("[dim]已取消这次录音（继续说，或输入 q 退出语音模式）[/dim]")
                 continue
             if wav is None:
