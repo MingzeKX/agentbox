@@ -17,7 +17,9 @@ without the operator having to remember ``/save``.  ``/save`` stays as a manual 
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -59,6 +61,7 @@ COMMANDS: tuple[str, ...] = (
     "speak",
     "tools",
     "pip",
+    "get",
     "archive",
     "config",
     "save",
@@ -87,6 +90,7 @@ SUBCOMMANDS: dict[str, tuple[str, ...]] = {
     "image": (),  # paths are typed, not completed
     "tools": ("list", "retire", "delete"),
     "pip": ("list", "install", "persist"),
+    "get": (),  # a sandbox path and an optional destination are typed, not completed
     "archive": ("list", "get", "rm"),
     "stop": ("now",),
 }
@@ -142,6 +146,17 @@ PIP_REPORT_MARKER = "@@PIP-LIST@@"
 
 #: byte units for /pip's total-size line
 PIP_BYTE_UNITS: tuple[str, ...] = ("B", "KB", "MB", "GB", "TB")
+
+#: `/get` reads one file out of the session sandbox and puts it on the host.  It is the
+#: console twin of the ``fs.pull`` tool: same guest RPC (``fs.read`` binary) and the same
+#: control-plane writer (``host.pull.write``), never ``/admin/config``.
+GET_READ_CHUNK_BYTES = 1_000_000
+#: extensions whose file is opened with the Windows default viewer after the copy
+GET_IMAGE_SUFFIXES: tuple[str, ...] = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+#: how ``/get`` may be told to replace a file that is already in var\pulled
+GET_OVERWRITE_FLAGS = ("--overwrite", "-f", "--force")
+#: where pulled files land when the control plane does not say (the AI-side default)
+GET_FALLBACK_ROOT = "var\\pulled"
 
 
 def _control_rpc(method: str, params: dict[str, Any] | None = None, timeout: float = 120.0) -> dict[str, Any]:
@@ -290,6 +305,16 @@ COMMAND_HELP: dict[str, str] = {
 
 `host.exec` 还需要控制面设置 AGENT_PERMISSION_TIER=unrestricted，并且
 它运行的每一条命令都会被记录下来。""",
+    "get": """[cyan]/get <沙箱路径> [目标名][/cyan]     把沙箱里 AI 生成的文件取到本机
+[cyan]/get /workspace/plot.png[/cyan]     取到 var\\pulled\\plot.png，并用默认看图程序打开
+[cyan]/get /workspace/out.csv report/a.csv[/cyan]  放到 var\\pulled\\report\\a.csv（子目录会自动建）
+
+* 走控制面 RPC（[cyan]host.pull.write[/cyan]），[bold]不经过 AI 服务的 /admin/config[/bold]，
+  所以 AI 服务挂了也能用；AI 服务自己在工具里用的是 [cyan]fs.pull[/cyan]。
+* 只允许 /workspace 下的文件，单个文件上限 [bold]8 MB[/bold]（AGENT_FS_PULL_MAX_BYTES）。
+* 目标名只能是 [bold]var\\pulled[/bold] 下的相对路径：不允许 `..`、不允许绝对路径。
+* 同名文件已存在会拒绝，加 [cyan]--overwrite[/cyan] 才覆盖。
+* 图片（png/jpg/jpeg/gif/webp/bmp）会用默认看图程序打开。""",
     "persona": """[cyan]/persona[/cyan]                        列出所有角色扮演并显示当前生效的那个
 [cyan]/persona roleplay[/cyan]               切换（内置：engineer、roleplay、teacher、
                                  reviewer、concise）
@@ -487,6 +512,7 @@ HELP = """
 [cyan]/voice-devices[/cyan] 列出麦克风 · [cyan]/speak on|off[/cyan] 朗读开关   [dim](/help voice-devices)[/dim]
 [cyan]/tools[/cyan]     注册表工具：列表 / retire / delete（不写 .env）  [dim](/help tools)[/dim]
 [cyan]/pip[/cyan]       本会话装包：list / install / persist           [dim](/help pip)[/dim]
+[cyan]/get[/cyan]       把沙箱里 AI 生成的文件/图片取到本机 var\\pulled    [dim](/help get)[/dim]
 [cyan]/archive[/cyan]   AI 的长期存档：列表 / get / rm（不写 .env）      [dim](/help archive)[/dim]
 [cyan]/config[/cyan]    所有运行时可改的设置                          [dim](/help config)[/dim]
 [cyan]/save[/cyan]      手动把当前值再同步到 VM 的 .env（改设置时已自动写入）
@@ -709,6 +735,7 @@ class SlashConsole:
             "speak": self._cmd_speak,
             "tools": self._cmd_tools,
             "pip": self._cmd_pip,
+            "get": self._cmd_get,
             "archive": self._cmd_archive,
             "clear": self._cmd_clear,
             "cls": self._cmd_clear,
@@ -1116,6 +1143,120 @@ class SlashConsole:
             "AGENT_SANDBOX_VM_MEMORY_MB 和 AGENT_SANDBOX_VM_CPUS，"
             "以及构建镜像时的 WORKSPACE_SIZE[/dim]"
         )
+
+    # ---------------------------------------------------------------------- get
+    def _get_write(self, dest: str, payload: bytes, *, append: bool, overwrite: bool) -> dict[str, Any]:
+        """One chunk to the control plane's ``host.pull.write`` (never /admin/config)."""
+        try:
+            return _control_rpc(
+                "host.pull.write",
+                {
+                    "dest": dest,
+                    "data_b64": base64.b64encode(payload).decode("ascii"),
+                    "append": append,
+                    "overwrite": overwrite,
+                },
+                timeout=120.0,
+            )
+        except SystemExit as exc:  # _control_rpc raises SystemExit when the plane is down
+            raise RuntimeError(
+                f"控制平面不可达（{exc}）。取文件必须经过控制平面 —— "
+                r"确认它在跑：.\start-agent.cmd，或 .\.venv\Scripts\python -m agent.cli serve control"
+            ) from exc
+
+    def _cmd_get(self, args: list[str]) -> None:  # noqa: ARG002
+        """``/get <sandbox path> [dest] [--overwrite]``: the console's half of fs.pull."""
+        items = [arg for arg in args if arg not in GET_OVERWRITE_FLAGS]
+        overwrite = len(items) != len(args)
+        if not items:
+            raise RuntimeError(
+                r"用法：/get <沙箱路径> [目标名] [--overwrite]　例：/get /workspace/plot.png"
+            )
+        path = items[0].strip().replace("\\", "/")
+        if not path.startswith("/"):
+            path = f"/workspace/{path}"
+        if not re.fullmatch(r"/workspace(/[^/\x00]+)*", path) or ".." in path.split("/"):
+            raise RuntimeError(f"只能取 /workspace 下的文件（收到 {items[0]!r}）")
+        dest = items[1].strip().replace("\\", "/") if len(items) > 1 else path.rsplit("/", 1)[-1]
+        if dest.startswith("/") or ":" in dest or ".." in dest.split("/"):
+            raise RuntimeError(r"目标名只能是 var\pulled 下的相对路径（不允许 .. 或绝对路径）")
+
+        session = self._sandbox_session()
+        chunks: list[bytes] = []
+        digest = hashlib.sha256()
+        size = 0
+        offset = 0
+        while True:
+            try:
+                body = _control_rpc(
+                    "sandbox.invoke",
+                    {
+                        "session_id": session,
+                        "kind": "native",
+                        "method": "fs.read",
+                        "params": {
+                            "path": path,
+                            "offset": offset,
+                            "max_bytes": GET_READ_CHUNK_BYTES,
+                            "binary": True,
+                        },
+                    },
+                    timeout=180.0,
+                )
+            except SystemExit as exc:
+                raise RuntimeError(
+                    f"控制平面不可达（{exc}）—— 沙箱读取也要经过它；确认控制平面在跑"
+                ) from exc
+            outcome = (body or {}).get("result") or {}
+            if not outcome.get("ok"):
+                raise RuntimeError(f"沙箱读不到 {path}：{str(outcome.get('error') or outcome)[:300]}")
+            result = outcome.get("result") or {}
+            size = int(result.get("size") or 0)
+            chunk = base64.b64decode(str(result.get("data_b64") or ""))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            digest.update(chunk)
+            offset += len(chunk)
+            if offset >= size:
+                break
+        payload = b"".join(chunks)
+
+        written: dict[str, Any] = {}
+        chunks_out = [
+            payload[start : start + GET_READ_CHUNK_BYTES]
+            for start in range(0, len(payload), GET_READ_CHUNK_BYTES)
+        ] or [b""]
+        for index, chunk in enumerate(chunks_out):
+            written = self._get_write(dest, chunk, append=index > 0, overwrite=overwrite)
+        host_path = str(written.get("path") or "")
+        if not host_path:
+            raise RuntimeError("控制面没有返回宿主机路径")
+        self.console.print(f"[green]已取到[/green] [bold]{host_path}[/bold]")
+        self.console.print(
+            f"[dim]{_pip_bytes(len(payload))} · sha256 {digest.hexdigest()[:16]}… · "
+            f"落在仓库的 {GET_FALLBACK_ROOT} 下[/dim]"
+        )
+        if Path(host_path).suffix.lower() in GET_IMAGE_SUFFIXES:
+            self._open_image(host_path)
+
+    def _open_image(self, host_path: str) -> None:
+        """Show the pulled image with the Windows default viewer (best effort)."""
+        executable = powershell_executable()
+        if not executable:
+            self.console.print("[yellow]没找到 powershell.exe，无法自动打开；请手动双击上面的路径[/yellow]")
+            return
+        try:
+            subprocess.run(  # noqa: S603 - fixed binary, explicit argv, path is ours
+                [executable, "-NoProfile", "-Command", "Start-Process", "-FilePath", host_path],
+                check=False,
+                capture_output=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.console.print(f"[yellow]无法自动打开图片（{exc}）；请手动双击上面的路径[/yellow]")
+            return
+        self.console.print("[dim]已用默认看图程序打开[/dim]")
 
     # ------------------------------------------------------------------------ pip
     def _sandbox_session(self) -> str:

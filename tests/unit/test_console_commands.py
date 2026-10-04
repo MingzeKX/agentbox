@@ -929,3 +929,69 @@ def test_tools_help_and_completion_are_discoverable():
     assert "/tools retire" in COMMAND_HELP["tools"]
     assert "/tools delete" in COMMAND_HELP["tools"]
     assert complete("/tools ") == ["/tools list", "/tools retire", "/tools delete"]
+
+
+# --------------------------------------------------------------------- /get (host pull)
+# `/get` is the console twin of the `fs.pull` tool: it reads the file out of the session
+# sandbox (`sandbox.invoke` -> guest `fs.read`) and hands the bytes to the control plane
+# (`host.pull.write`).  It must never go through the AI service's `/admin/config`: that
+# endpoint is for settings, and the file has to come out even when the service is down.
+
+
+def test_get_hands_the_bytes_to_the_control_plane_and_never_admin_config(shell, tmp_path, monkeypatch):
+    sh, console, state = shell
+    state.session_id = "s-test"
+    payload = b"\x89PNG\r\n\x1a\n" + b"7" * 300
+    calls: list[tuple[str, dict, float]] = []
+    opened: list[list[str]] = []
+
+    def fake_rpc(method, params=None, timeout=120.0):  # noqa: ANN001
+        calls.append((method, dict(params or {}), timeout))
+        if method == "sandbox.invoke":
+            return {
+                "ok": True,
+                "result": {
+                    "ok": True,
+                    "result": {
+                        "path": "/workspace/plot.png",
+                        "size": len(payload),
+                        "data_b64": base64.b64encode(payload).decode("ascii"),
+                    },
+                },
+            }
+        return {"ok": True, "path": str(tmp_path / "pulled" / "plot.png"), "bytes": len(payload)}
+
+    monkeypatch.setattr("agent.cli.main._control_rpc", fake_rpc)
+    monkeypatch.setattr("subprocess.run", lambda argv, **kw: opened.append(list(argv)))
+
+    assert sh.handle("/get /workspace/plot.png") is True
+
+    methods = [method for method, _, _ in calls]
+    assert methods == ["sandbox.invoke", "host.pull.write"], f"unexpected RPCs: {methods}"
+    assert not any("admin/config" in str(call) for call in calls)
+    read = calls[0][1]
+    assert read["session_id"] == "s-test" and read["method"] == "fs.read"
+    assert read["params"]["path"] == "/workspace/plot.png" and read["params"]["binary"] is True
+    write = calls[1][1]
+    assert write["dest"] == "plot.png" and write["append"] is False and write["overwrite"] is False
+    assert base64.b64decode(write["data_b64"]) == payload
+    text = output(console)
+    assert "plot.png" in text and "308 B" in text, "the operator must see where the file landed"
+    assert opened and "Start-Process" in opened[0], "a .png must be opened with the default viewer"
+    assert sh.calls == [], "the file path must not touch /admin/config"
+
+
+def test_get_refuses_a_path_outside_the_workspace_and_a_dest_that_escapes(shell, monkeypatch):
+    sh, console, _ = shell
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "agent.cli.main._control_rpc",
+        lambda method, params=None, timeout=120.0: calls.append(method) or {},  # noqa: ARG005
+    )
+
+    assert sh.handle("/get /etc/passwd") is True
+    assert sh.handle("/get /workspace/../../etc/passwd") is True
+    assert sh.handle("/get /workspace/a.png ../escape.png") is True
+    assert calls == [], "a refused /get must not reach the control plane"
+    assert "已取到" not in output(console)
+

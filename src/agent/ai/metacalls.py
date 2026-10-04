@@ -19,6 +19,7 @@ from agent.ai import tiers
 from agent.ai.builtins import BUILTIN_HANDLERS
 from agent.ai.mcp_tools import MCP_HANDLERS
 from agent.ai.net import NET_HANDLERS
+from agent.ai.pull import PULL_HANDLERS
 from agent.ai.sandbox_gateway import SandboxGateway
 from agent.config import settings
 from agent.embeddings import Embedder, get_embedder
@@ -351,6 +352,7 @@ class MetaTools:
                 TOOLSMITH_HANDLERS.get(name)
                 or NET_HANDLERS.get(name)
                 or MCP_HANDLERS.get(name)
+                or PULL_HANDLERS.get(name)
                 or BUILTIN_HANDLERS.get(name)
             )
             if handler is None:

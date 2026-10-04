@@ -126,6 +126,17 @@ def create_app() -> FastAPI:
                     return _ok(await host_exec.run(settings, **params))
                 except host_exec.HostExecError as exc:
                     return _error(ErrorCode.PERMISSION_DENIED, str(exc))
+            if method == "host.pull.write":
+                from agent.control.host import pull as host_pull
+
+                try:
+                    return _ok(host_pull.write(settings, **params))
+                except host_pull.HostPullError as exc:
+                    return _error(ErrorCode.PERMISSION_DENIED, str(exc))
+            if method == "host.pull.info":
+                from agent.control.host import pull as host_pull
+
+                return _ok(host_pull.describe(settings))
             if method == "host.info":
                 from agent.control.host import exec as host_exec
 

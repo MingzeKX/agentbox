@@ -128,6 +128,15 @@ powershell -ExecutionPolicy Bypass -File .\deploy\windows\stop-agent.ps1
 | `/config` | 所有运行时可改项（改完**立即生效并写入 VM 的 `.env`**） | `/config`、`/config tool_extra_modules smtplib` |
 | `/save` | 手动再把当前值同步一次到 VM 的 `.env`（正常不需要） | `/save` |
 | `/sandbox` | 沙箱池状态（VM 列表 / 加速器 / 预热数） | `/sandbox` |
+| `/get` | 把沙箱里 AI 生成的文件/图片取到本机 `var\pulled\`（图片会自动打开） | `/get /workspace/plot.png`、`/get /workspace/out.csv report/a.csv` |
+
+> **`/get` 取文件**（AI 侧对应的工具是 **`fs.pull`**）：读 `sandbox.invoke` → 来宾
+> `fs.read`，写控制面 RPC **`host.pull.write`**，**不经过 AI 服务的 `/admin/config`**，
+> 所以 AI 服务挂了也能取。只允许 `/workspace` 下的文件，单个文件上限 **8 MB**
+> （`AGENT_FS_PULL_MAX_BYTES`）；目标名只能是 `var\pulled\` 下的相对路径
+> （不允许 `..` 或绝对路径，子目录会自动建）；同名文件已存在会拒绝，加 `--overwrite` 才覆盖。
+> 图片（png/jpg/jpeg/gif/webp/bmp）取完后用默认看图程序打开。AI 自己生成图片/文件后
+> 也可以直接调 `fs.pull`，效果一样。
 
 > 自定义 persona：把 `<name>.md` 放进仓库根的 `personas\`（同名会覆盖内置）。
 > 人格名只允许 `[a-z0-9_-]{1,32}`，`..\..\etc\passwd` 这种会被拒并降级。

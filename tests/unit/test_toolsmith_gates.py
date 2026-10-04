@@ -287,9 +287,14 @@ def test_toolsmith_handlers_cover_the_seeded_core_tools():
     # MCP integration
     from agent.ai.builtins import BUILTIN_HANDLERS
     from agent.ai.mcp_tools import MCP_HANDLERS
+    from agent.ai.pull import PULL_HANDLERS
 
     # host_native tools are served by the toolsmith pipeline, the network client, the
-    # MCP integration or the small built-ins (time.now)
+    # MCP integration, the host pull reader or the small built-ins (time.now)
     assert host_tools == (
-        set(gates.TOOLSMITH_HANDLERS) | set(NET_HANDLERS) | set(MCP_HANDLERS) | set(BUILTIN_HANDLERS)
+        set(gates.TOOLSMITH_HANDLERS)
+        | set(NET_HANDLERS)
+        | set(MCP_HANDLERS)
+        | set(PULL_HANDLERS)
+        | set(BUILTIN_HANDLERS)
     )

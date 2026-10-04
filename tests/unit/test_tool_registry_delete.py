@@ -781,11 +781,16 @@ def test_toolsmith_handlers_still_cover_every_host_native_core_tool():
     from agent.ai.builtins import BUILTIN_HANDLERS
     from agent.ai.mcp_tools import MCP_HANDLERS
     from agent.ai.net import NET_HANDLERS
+    from agent.ai.pull import PULL_HANDLERS
     from agent.registry.seed import CORE_TOOLS
 
     host_tools = {spec["name"] for spec in CORE_TOOLS if spec["executor"] == "host_native"}
     assert host_tools == (
-        set(gates.TOOLSMITH_HANDLERS) | set(NET_HANDLERS) | set(MCP_HANDLERS) | set(BUILTIN_HANDLERS)
+        set(gates.TOOLSMITH_HANDLERS)
+        | set(NET_HANDLERS)
+        | set(MCP_HANDLERS)
+        | set(PULL_HANDLERS)
+        | set(BUILTIN_HANDLERS)
     )
 
 

@@ -213,6 +213,14 @@ class Settings(BaseSettings):
     # must stay inside it
     host_workdir: str = ""
     host_exec_timeout_s: float = 60.0
+    # Bringing a *produced* file back out of the sandbox is not host.exec: it is the
+    # transport half of the task, so it needs its own switch and phrase rather than
+    # the unrestricted tier.  Everything lands under <var_dir>/pulled and can never
+    # overwrite an existing file unless the caller asks for it.
+    host_pull_enabled: bool = True
+    host_pull_phrase: str = "PULL-FROM-SANDBOX"
+    #: hard cap on one pulled file (both the AI service and the control plane enforce it)
+    fs_pull_max_bytes: int = 8_000_000
 
     # ---------------------------------------------------------------- persona
     # AGENT_PERSONA picks a markdown persona injected into the system prompt.

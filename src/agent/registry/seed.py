@@ -281,6 +281,55 @@ CORE_TOOLS: list[dict[str, Any]] = [
     },
     # ------------------------------------------------------------ built-ins
     {
+        "name": "fs.pull",
+        "description": (
+            "Copy a file the sandbox produced onto the host machine, into the repo's "
+            "var\\pulled directory, and return its host path (the operator opens it with /get)."
+        ),
+        "when_to_use": (
+            "Whenever the result of the work IS a file or an image (a plot, a report, a "
+            "screenshot) and the operator should be able to open it from Windows. Reads "
+            "through the sandbox gateway and writes through the control plane, so the AI "
+            "service never touches the host filesystem itself. Cap: 8 MB. Never overwrites "
+            "an existing file unless overwrite=true."
+        ),
+        "tags": ["file", "host", "artifact", "image", "download"],
+        "executor": "host_native",
+        "permissions": [],
+        "timeout_s": 180,
+        "params_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "sandbox path of the file, inside /workspace (the only writable path)",
+                },
+                "dest": {
+                    "type": "string",
+                    "description": (
+                        "optional host destination, relative to var\\pulled; "
+                        "defaults to the file's own name. No '..', no absolute path."
+                    ),
+                },
+                "overwrite": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "replace the host file when it already exists",
+                },
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+        "examples": [
+            {"arguments": {"path": "/workspace/plot.png"}, "note": "lands in var\\pulled\\plot.png"},
+            {
+                "arguments": {"path": "/workspace/report.md", "dest": "runs/2024/report.md"},
+                "note": "subdirectories under var\\pulled are created",
+            },
+        ],
+        "source": "host handler: AI service pull reader + control-plane handler agent.control.host.pull",
+    },
+    {
         "name": "time.now",
         "description": "Current date and time (UTC, plus the service's local zone and epoch seconds).",
         "when_to_use": (
