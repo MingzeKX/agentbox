@@ -19,6 +19,26 @@ from agent.sandbox import checker
 
 REPO = Path(__file__).resolve().parents[2]
 
+#: one curated root per family the operator complains about most (HTTP, XML/HTML, YAML,
+#: Excel, imaging, numerics) so a regression in the profile is caught for each
+CURATED_ROOTS = (
+    ("requests", "import requests"),
+    ("urllib3", "import urllib3"),
+    ("certifi", "import certifi"),
+    ("charset_normalizer", "import charset_normalizer"),
+    ("idna", "import idna"),
+    ("bs4", "from bs4 import BeautifulSoup"),
+    ("soupsieve", "import soupsieve"),
+    ("lxml", "from lxml import etree"),
+    ("yaml", "import yaml"),
+    ("dateutil", "from dateutil import parser"),
+    ("pytz", "import pytz"),
+    ("openpyxl", "import openpyxl"),
+    ("PIL", "from PIL import Image"),
+    ("numpy", "import numpy"),
+    ("pandas", "import pandas"),
+)
+
 SMTP_TOOL = '''import smtplib
 from email.message import EmailMessage
 
@@ -39,6 +59,20 @@ def run(args):
 
 def rules(report: checker.Report) -> set[str]:
     return {finding.rule for finding in report.findings}
+
+
+def third_party_tool(statement: str) -> str:
+    """A minimal, otherwise valid tool whose only interesting line is ``statement``."""
+    return f"{statement}\n\n\ndef run(args):\n    return {{'ok': True}}\n"
+
+
+def import_findings(report: checker.Report) -> list[checker.Finding]:
+    """Only the import verdicts; a real tool's version probing is a separate rule.
+
+    ``requests.__version__`` trips ``dunder_attribute`` (unchanged policy), which would
+    otherwise mask the import verdict this module is about.
+    """
+    return [finding for finding in report.findings if finding.rule.startswith("import_")]
 
 
 def test_strict_still_refuses_smtplib():
@@ -69,6 +103,65 @@ def test_unrestricted_allows_an_unlisted_module():
 def test_unknown_profile_falls_back_to_strict():
     assert checker.allowed_modules("exTENDED") is not None  # case-insensitive match
     assert checker.allowed_modules("nonsense") == dict(checker.ALLOWED_IMPORTS)
+
+
+# ------------------------------------------------- third-party imports (live complaint)
+# `import requests` is the exact shape a model writes and the checker rejected: the package
+# is baked into the sandbox image (deploy/sandbox/build-sandbox-image.sh), so the "extended"
+# profile -- and only that one -- has to admit it.  strict stays stdlib-only on purpose.
+
+
+def test_requests_is_rejected_under_strict_and_accepted_under_extended():
+    source = third_party_tool("import requests")
+    strict = checker.check_source(source, profile="strict")
+    assert strict.ok is False
+    assert [finding.rule for finding in import_findings(strict)] == ["import_forbidden"]
+
+    extended = checker.check_source(source, profile="extended")
+    assert extended.ok is True, [finding.message for finding in import_findings(extended)]
+    assert extended.stats["imports"] == ["requests"]
+
+
+def test_extended_lists_every_curated_root_including_third_party():
+    for module in ("requests", "bs4", "lxml", "yaml", "openpyxl", "PIL", "numpy", "pandas"):
+        assert module in checker.EXTENDED_IMPORTS, module
+    assert checker.THIRD_PARTY_IMPORTS <= checker.EXTENDED_IMPORTS
+
+
+@pytest.mark.parametrize("module,statement", CURATED_ROOTS)
+def test_every_curated_root_needs_extended(module, statement):  # noqa: ARG001 - module is the id
+    source = third_party_tool(statement)
+    assert checker.check_source(source, profile="strict").ok is False, "strict must stay stdlib-only"
+    report = checker.check_source(source, profile="extended")
+    assert report.ok is True, [finding.message for finding in import_findings(report)]
+
+
+def test_a_third_party_module_is_still_rejected_under_strict_even_with_allow_open():
+    """`allow_open` is about open(), not about imports: it must not widen the allow-list."""
+    source = "import requests\n\n\ndef run(args):\n    with open(args['path']) as handle:\n        return {'ok': True, 'text': handle.read()}\n"
+    report = checker.check_source(source, permissions=["fs.read"], profile="strict", allow_open=True)
+    assert report.ok is False
+    assert [finding.rule for finding in import_findings(report)] == ["import_forbidden"]
+
+
+def test_unrestricted_admits_any_third_party_root():
+    """The escape hatch: a package installed per session (/pip install) needs no allow-listing."""
+    source = third_party_tool("import pyftpdlib")
+    strict = checker.check_source(source, profile="strict")
+    assert strict.ok is False
+    assert [finding.rule for finding in import_findings(strict)] == ["import_forbidden"]
+
+    report = checker.check_source(source, profile="unrestricted")
+    assert report.ok is True, [finding.message for finding in import_findings(report)]
+    assert report.stats["imports"] == ["pyftpdlib"]
+
+
+def test_a_rejection_also_names_the_unrestricted_escape_hatch():
+    report = checker.check_source(third_party_tool("import pyftpdlib"), profile="extended")
+    message = " ".join(finding.message for finding in report.findings)
+    assert "/config tool_extra_modules pyftpdlib" in message
+    assert "tool_import_profile extended" in message
+    assert "unrestricted" in message, "the ad-hoc (/pip install) path must be discoverable"
 
 
 def test_extra_modules_widen_one_module_at_a_time():

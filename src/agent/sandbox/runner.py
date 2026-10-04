@@ -10,6 +10,11 @@ tool declared.  The runner injects the ``fs`` and ``sh`` helper namespaces into
 the tool module, calls the entrypoint and writes a JSON result.  Every helper
 re-checks the permission it needs, so a tool cannot exceed its manifest even if
 the static checker were bypassed.
+
+Imports: the image ships a curated third-party set (see
+``deploy/sandbox/build-sandbox-image.sh``) and anything else a session installs with
+``pip install --target /workspace/pylibs <pkg>`` is importable because
+:func:`add_pylibs` puts that directory on ``sys.path``.
 """
 
 from __future__ import annotations
@@ -31,9 +36,33 @@ except ImportError:  # pragma: no cover - guest layout
 
 MAX_RESULT_BYTES = 1_048_576
 
+#: where a session installs packages it was not built with:
+#: ``pip install --target /workspace/pylibs <pkg>`` puts them here and the next tool run
+#: can import them.  /workspace is the only writable path, and it is per-session, so this
+#: is the ad-hoc half; the curated set baked into the image is the durable half.
+PYLIBS = os.environ.get("AGENT_TOOL_PYLIBS") or "/workspace/pylibs"
+
 
 class ToolError(RuntimeError):
     pass
+
+
+def add_pylibs(path: str | None = None) -> str | None:
+    """Put the session's ``pylibs`` directory on ``sys.path`` when it exists.
+
+    Returns the path that was added, or ``None``.  Safe to call repeatedly: the entry is
+    never duplicated and a missing directory is a no-op, so a tool run before any package
+    was installed behaves exactly as before.
+    """
+    target = path or PYLIBS
+    if not target or not os.path.isdir(target):
+        return None
+    if target not in sys.path:
+        sys.path.insert(0, target)
+    return target
+
+
+add_pylibs()
 
 
 class FsApi:
@@ -204,6 +233,9 @@ class ShApi:
 def _load_tool(path: str, entrypoint: str, permissions: set[str], args: dict[str, Any]):
     if not os.path.isfile(path):
         raise ToolError(f"tool source {path} is missing")
+    # a package installed into /workspace/pylibs during THIS run of the VM must be
+    # importable by the tool even though the runner started before it existed
+    add_pylibs()
     spec = importlib.util.spec_from_file_location(f"agent_tool_{int(time.time() * 1000)}", path)
     if spec is None or spec.loader is None:
         raise ToolError(f"cannot load tool from {path}")

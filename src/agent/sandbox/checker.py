@@ -95,7 +95,30 @@ DENIED_ATTRIBUTES: dict[str, set[str]] = {
     "typing": {"get_type_hints"},
 }
 
-#: names that may legitimately be referenced even though they look like dunders
+#: third-party roots baked into the sandbox image (see
+#: ``deploy/sandbox/build-sandbox-image.sh``).  They are importable in the guest, but only
+#: the ``extended`` profile admits them: ``strict`` stays exactly the stdlib allow-list, so
+#: the default posture is unchanged and an operator must opt in explicitly.
+THIRD_PARTY_IMPORTS: frozenset[str] = frozenset(
+    {
+        "requests",
+        "urllib3",
+        "certifi",
+        "charset_normalizer",
+        "idna",
+        "bs4",
+        "soupsieve",
+        "lxml",
+        "yaml",
+        "dateutil",
+        "pytz",
+        "openpyxl",
+        "PIL",
+        "numpy",
+        "pandas",
+    }
+)
+
 #: modules added by the "extended" profile: real scripting without the exotic corners
 EXTENDED_IMPORTS: frozenset[str] = frozenset(
     {
@@ -127,7 +150,7 @@ EXTENDED_IMPORTS: frozenset[str] = frozenset(
         "pwd",
         "grp",
     }
-)
+) | THIRD_PARTY_IMPORTS
 
 #: profile name -> extra root modules (None = only ALLOWED_IMPORTS, "*" = anything)
 PROFILES: dict[str, frozenset[str] | None | str] = {
@@ -140,7 +163,9 @@ PROFILES: dict[str, frozenset[str] | None | str] = {
 #: appended to an import rejection so the fix is one copy-paste away
 HOW_TO_WIDEN = (
     "; to allow it: /config tool_extra_modules {module}   (only this module)  "
-    "or /config tool_import_profile extended   (the usual scripting set)"
+    "or /config tool_import_profile extended   (the usual scripting set)  "
+    "or /config tool_import_profile unrestricted   (any module, e.g. one installed "
+    "in this session with /pip install)"
 )
 
 
@@ -301,10 +326,13 @@ class _Visitor(ast.NodeVisitor):
             self.report("relative_import", "relative imports are not allowed", node)
             return
         module = node.module or ""
+        root, _, sub = module.partition(".")
+        # Recorded even when it is rejected: the stats must say what the tool *tried* to
+        # import, which is what a rejection message is read against.
+        self.imports.append(module or root)
         if node.names and any(alias.name == "*" for alias in node.names):
             self.report("star_import", "'from ... import *' is not allowed", node)
             return
-        root, _, sub = module.partition(".")
         allowed = ALLOWED_IMPORTS.get(root, "missing")
         if allowed == "missing":
             self.report("import_forbidden", f"module {root!r} is not in the allow-list", node)
@@ -320,11 +348,11 @@ class _Visitor(ast.NodeVisitor):
                         f"'from {root} import {alias.name}' is not allowed; only {sorted(allowed)} may be imported",
                         node,
                     )
-        self.imports.append(module or root)
         self.generic_visit(node)
 
     def _check_module(self, name: str, node: ast.AST, asname: str | None) -> None:
         root, _, sub = name.partition(".")
+        self.imports.append(name)
         allowed = ALLOWED_IMPORTS.get(root, "missing")
         if allowed == "missing":
             self.report("import_forbidden", f"module {root!r} is not in the allow-list", node)

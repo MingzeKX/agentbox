@@ -31,6 +31,30 @@ WORKSPACE_SIZE="${WORKSPACE_SIZE:-4096M}"
 SANDBOX_UID="${SANDBOX_UID:-1000}"
 SANDBOX_GID="${SANDBOX_GID:-1000}"
 
+# ---------------------------------------------------------------------------
+# Python packages baked into the guest's system site-packages.
+#
+# Why: a model-authored tool that does `import requests` used to be rejected by the
+# static checker *and* had nowhere to install anything -- the sandbox root is
+# read-only and /workspace is per-session.  Baking a curated set into the image is
+# the durable fix (the checker admits these roots in its "extended" profile).
+#
+# Extend it without editing this file:
+#   EXTRA_PIP="httpx tenacity"     extra packages (space or comma separated)
+#   SKIP_EXTRA_PIP=1               skip the whole step (fast/offline rebuilds)
+#
+# The console's /pip persist writes the operator's package names into the platform
+# VM's .env as AGENT_SANDBOX_EXTRA_PIP, so a rebuild picks them up without a shell.
+# ---------------------------------------------------------------------------
+PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+PIP_TRUSTED_HOST="${PIP_TRUSTED_HOST:-pypi.tuna.tsinghua.edu.cn}"
+SKIP_EXTRA_PIP="${SKIP_EXTRA_PIP:-0}"
+CURATED_PIP="${CURATED_PIP:-requests urllib3 certifi charset-normalizer idna beautifulsoup4 \
+soupsieve lxml pyyaml python-dateutil pytz openpyxl pillow numpy pandas}"
+# Extra packages the operator asked for from the console (/pip persist).  Read from the
+# environment / .env so the image can carry them without editing this script.
+PERSISTED_PIP="${AGENT_SANDBOX_EXTRA_PIP:-${PERSISTED_PIP:-}}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 GUEST_SRC="${REPO_DIR}/src/agent/sandbox"
@@ -75,7 +99,7 @@ apt-get install -y -qq --no-install-recommends debootstrap e2fsprogs qemu-utils 
 echo "==> debootstrap ${SUITE}/${ARCH} into ${ROOTFS}"
 # python3-minimal has a stripped stdlib (no ctypes/shutil/threading), which made
 # PID 1 die with "No module named ctypes" and panic the kernel: use the full package.
-INCLUDE="python3,passwd,kmod,initramfs-tools,linux-image-${ARCH},util-linux,coreutils,bash,\
+INCLUDE="python3,python3-pip,python3-venv,passwd,kmod,initramfs-tools,linux-image-${ARCH},util-linux,coreutils,bash,\
 procps,findutils,grep,sed,gawk,tar,gzip,xz-utils,file,diffutils,patch,less,nftables,iproute2,\
 iputils-ping,ca-certificates"
 # debootstrap has no download timeout: a single stalled connection hangs the
@@ -123,6 +147,9 @@ mount -t proc proc "${ROOTFS}/proc"
 mount -t sysfs sys "${ROOTFS}/sys"
 mount --bind /dev "${ROOTFS}/dev"
 cp -f /etc/resolv.conf "${ROOTFS}/etc/resolv.conf" 2>/dev/null || true
+# baseline for the "what did the curated packages cost?" report at the end
+du -sb --exclude="${ROOTFS}/proc" --exclude="${ROOTFS}/sys" "${ROOTFS}" | cut -f1 \
+  > "${BUILD}/rootfs-size-before-pip"
 
 echo "==> creating the sandbox group and user (uid/gid ${SANDBOX_UID})"
 # 必须先建组：useradd -g <gid> 要求该 GID 已存在，否则会失败（以前被 `|| true` 吞掉，
@@ -208,7 +235,8 @@ chmod 0644 "${ROOTFS}/etc/agent/nftables-net.conf"
 # /etc is part of the read-only root, so the resolver config lives on the /run tmpfs and
 # /etc/resolv.conf is only a symlink to it (the guest fills it in when a NIC is present).
 install -d "${ROOTFS}/run/agent"
-ln -sfn /run/agent/resolv.conf "${ROOTFS}/etc/resolv.conf"
+rm -f "${ROOTFS}/etc/resolv.conf"
+ln -s /run/agent/resolv.conf "${ROOTFS}/etc/resolv.conf"
 # a usable apt source: the operator can `apt-get update && apt-get install ...` when the
 # sandbox network switch is on
 cat > "${ROOTFS}/etc/apt/sources.list" <<'SOURCES'
@@ -258,12 +286,100 @@ then
   exit 1
 fi
 
+# pip itself is part of the image: `pip install --target /workspace/pylibs <pkg>` is how a
+# session gets a package that is not baked in (see the guest runner's sys.path handling).
+# install-platform packages it in the guest, but a callable pip is a hard requirement here.
+if ! chroot "${ROOTFS}" /usr/bin/python3 -m pip --version >/dev/null 2>&1; then
+  echo "==> installing python3-pip/python3-venv in the guest"
+  if ! chroot "${ROOTFS}" env DEBIAN_FRONTEND=noninteractive \
+       apt-get install -y -qq --no-install-recommends python3-pip python3-venv >/dev/null; then
+    echo "!!! could not install python3-pip/python3-venv in the guest; check the mirror" >&2
+    exit 1
+  fi
+fi
+if ! chroot "${ROOTFS}" /usr/bin/python3 -m pip --version; then
+  echo "!!! the guest image has no working pip" >&2
+  exit 1
+fi
+
+if [[ "${SKIP_EXTRA_PIP}" == "1" ]]; then
+  echo "==> SKIP_EXTRA_PIP=1: not installing the curated python packages"
+  PIP_PACKAGES="${CURATED_PIP}  [skipped]"
+else
+  echo "==> installing the curated python packages into the guest (mirror ${PIP_INDEX_URL})"
+  # EXTRA_PIP accepts spaces and/or commas ("httpx, tenacity"); the persisted list
+  # (AGENT_SANDBOX_EXTRA_PIP in the platform .env) is appended to it.
+  EXTRA_PIP="${EXTRA_PIP:-} ${PERSISTED_PIP}"
+  EXTRA_PIP="${EXTRA_PIP//,/ }"
+  PACKAGES="${CURATED_PIP} ${EXTRA_PIP}"
+  read -r -a PACKAGE_LIST <<< "${PACKAGES}"
+  PIP_PACKAGES="${PACKAGE_LIST[*]}"
+
+  # The run-time /etc/resolv.conf is a symlink into /run (see below) and the build
+  # copied the host's resolver early on; make sure it is still a real file for pip.
+  if [[ ! -s "${ROOTFS}/etc/resolv.conf" ]]; then
+    rm -f "${ROOTFS}/etc/resolv.conf"
+    cp -f /etc/resolv.conf "${ROOTFS}/etc/resolv.conf" 2>/dev/null || true
+  fi
+
+  if ! chroot "${ROOTFS}" env DEBIAN_FRONTEND=noninteractive \
+       PIP_INDEX_URL="${PIP_INDEX_URL}" PIP_TRUSTED_HOST="${PIP_TRUSTED_HOST}" \
+       PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1 \
+       /usr/bin/python3 -m pip install --no-cache-dir --break-system-packages \
+       --retries 3 --timeout 60 "${PACKAGE_LIST[@]}"; then
+    echo "!!! pip install failed in the guest (packages: ${PACKAGE_LIST[*]})" >&2
+    echo "    fix the mirror with PIP_INDEX_URL=... or skip the step with SKIP_EXTRA_PIP=1" >&2
+    exit 1
+  fi
+
+  echo "==> smoke-testing the curated imports in the chroot"
+  # Same style as the stdlib smoke test above: fail loudly and name what is missing.
+  if ! chroot "${ROOTFS}" /usr/bin/python3 - <<'PY'
+import sys
+
+missing = []
+for name in ("requests", "yaml", "bs4", "lxml", "openpyxl", "PIL", "numpy", "pandas"):
+    try:
+        __import__(name)
+    except Exception as exc:  # noqa: BLE001 - report every failure, not just the first
+        missing.append(f"{name}: {exc}")
+if missing:
+    print("MISSING CURATED PACKAGES:")
+    for item in missing:
+        print("  ", item)
+    sys.exit(1)
+import requests
+
+print("  curated packages ok: requests", requests.__version__)
+PY
+  then
+    echo "!!! the curated python packages are not importable in the guest image" >&2
+    echo "    install them with EXTRA_PIP=... or fix PIP_INDEX_URL (${PIP_INDEX_URL})" >&2
+    exit 1
+  fi
+
+  # pip stays in the image on purpose (it is how a session installs anything else), but it
+  # must be usable by the unprivileged sandbox user: the only writable path is /workspace.
+  chroot "${ROOTFS}" /usr/bin/python3 -m pip --version
+  # Bytecode for the baked packages, so the read-only root never has to write any.
+  chroot "${ROOTFS}" /usr/bin/python3 - <<'PY' || true
+import compileall
+import site
+
+for root in site.getsitepackages():
+    compileall.compile_dir(root, quiet=2, force=True)
+PY
+  # How much the curated packages cost, measured on the same tree the image is made of.
+  du -sb --exclude="${ROOTFS}/proc" --exclude="${ROOTFS}/sys" "${ROOTFS}" \
+    | cut -f1 > "${BUILD}/rootfs-size-after-pip"
+fi
+
 # 用与真实运行完全相同的方式导入：guest 里是 `python3 /usr/lib/agent/sandbox/xxx.py`
 # （脚本目录自动进 sys.path），所以这里导入同级模块，而不是 sandbox.* 包路径。
 if ! chroot "${ROOTFS}" /usr/bin/python3 - <<'PY'
 import sys
 sys.path.insert(0, "/usr/lib/agent/sandbox")
-import checker, limits, policy, handlers, executor, runner, init
+import checker, limits, policy, handlers, executor, runner, init, network
 print("  guest modules import cleanly")
 PY
 then
@@ -306,6 +422,16 @@ cp -f "${KERNEL}" "${OUT}/vmlinuz"
 cp -f "${INITRD}" "${OUT}/initrd.img"
 
 echo "==> verifying the produced image"
+# Evidence for the "third-party imports work" claim: what the packages cost in the
+# very tree rootfs.img is built from.
+if [[ -s "${BUILD}/rootfs-size-before-pip" && -s "${BUILD}/rootfs-size-after-pip" ]]; then
+  python3 - "$(cat "${BUILD}/rootfs-size-before-pip")" "$(cat "${BUILD}/rootfs-size-after-pip")" <<'PY'
+import sys
+
+before, after = (int(value) for value in sys.argv[1:3])
+print(f"  python packages added {((after - before) / 1048576):8.1f} MiB to the root filesystem")
+PY
+fi
 python3 - "$OUT" <<'PY'
 import sys
 from pathlib import Path
@@ -326,6 +452,7 @@ cat <<EOF
 sandbox image ready in ${OUT}
   kernel    : $(basename "${KERNEL}")
   initramfs : $(basename "${INITRD}")
+  packages  : ${PIP_PACKAGES:-${CURATED_PIP}}
 
 next (the control plane runs on the Windows host and needs these four files):
   1. serve them from this VM (the host reaches the VM through port forwarding):
