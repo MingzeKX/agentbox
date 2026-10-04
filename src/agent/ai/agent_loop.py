@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from agent.ai import personas
 from agent.ai.history import HISTORY_MESSAGE_MAX_CHARS, drop_leading_orphans, for_history, truncate_for_history
 from agent.ai.llm import LLMClient, LLMError
-from agent.ai.metacalls import MetaTools
+from agent.ai.metacalls import DispatchOutcome, MetaTools
 from agent.config import settings
 from agent.registry import repository as repo
 
@@ -185,7 +185,21 @@ class AgentLoop:
                     "tool_call",
                     {"step": step_index, "tool": call.name, "arguments": call.arguments, "id": call.id},
                 )
-                outcome = await self.meta.call(call.name, call.arguments)
+                try:
+                    outcome = await self.meta.call(call.name, call.arguments)
+                except Exception as exc:  # noqa: BLE001 - a crashed tool must still be answered
+                    # Every declared tool_call has to be answered by a tool message: an
+                    # assistant message with an unanswered call is invalid for the API, and
+                    # because the row stays in the session history it used to make *every*
+                    # later turn of that session fail with HTTP 400 (in ~200 ms, before the
+                    # model ran) until the operator started a new session.
+                    log.warning("tool %s raised %s: %s", call.name, type(exc).__name__, exc)
+                    outcome = DispatchOutcome(
+                        False,
+                        tool=call.name,
+                        error=f"tool crashed: {type(exc).__name__}: {exc}",
+                        error_code="handler_raised",
+                    )
                 step = Step(
                     index=step_index,
                     tool=call.name,

@@ -378,3 +378,80 @@ def test_llm_error_detail_truncates_a_huge_gateway_body():
     assert len(detail) < 300
     assert detail.endswith("…")
     assert LLMError("boom").detail() == "boom", "no body -> unchanged message"
+
+
+# --------------------------------------------------- the shape found in the live DB
+# Session s-1fcbb55f39c74adc (35 messages, so the whole history is sent on every turn)
+# held an assistant message declaring call_00_jdGnCpyoJAkRSuGAUJqT2756 with no tool
+# message answering it: the tool call had died ("control plane unreachable"), so the loop
+# persisted the declaration and never the result.  Every later turn -- including the
+# operator's retries -- was rejected with HTTP 400 in ~200 ms until /new.
+
+
+def _live_poison() -> list[dict[str, Any]]:
+    """The stored history of s-1fcbb55f39c74adc, in shape."""
+    dangling = _assistant_with_call("call_00_jdGnCpyoJAkRSUGAUJqT2756")
+    # the real row carried the model's explanation of the failed registration
+    dangling["content"] = "注册这一步失败了，但不是我的代码问题——是控制平面不可达"
+    return [
+        {"role": "system", "content": "contract"},
+        {"role": "user", "content": "你好啊"},
+        dangling,
+        {"role": "user", "content": "请问你是谁"},
+    ]
+
+
+def test_a_dangling_tool_call_from_a_crashed_tool_is_pruned():
+    safe = sanitize_history(_live_poison())
+
+    assistant = next(message for message in safe if message["role"] == "assistant")
+    assert "tool_calls" not in assistant, "an unanswered declaration is what the gateway rejects"
+    assert "控制平面不可达" in assistant["content"], "the model's own words are kept"
+    assert [message["role"] for message in safe] == ["system", "user", "assistant", "user"]
+    assert [message["content"] for message in safe if message["role"] == "user"] == ["你好啊", "请问你是谁"]
+
+
+def test_a_dangling_tool_call_with_no_text_is_dropped_whole():
+    """Nothing is left for the model to read, so the message itself goes."""
+    safe = sanitize_history(
+        [{"role": "user", "content": "hi"}, _assistant_with_call("ghost"), {"role": "user", "content": "still there?"}]
+    )
+    assert [message["role"] for message in safe] == ["user", "user"]
+
+
+@pytest.mark.asyncio
+async def test_a_crashed_tool_call_is_still_answered_so_history_stays_valid(fake_sessionmaker, stored):
+    """The write side: a tool that raises must still produce a `tool` row."""
+    events: list[tuple[str, dict]] = []
+    call = LLMToolCall(id="call_dead", name="call_tool", arguments={}, raw_arguments="{}")
+    llm = ScriptedLLM(
+        [
+            LLMResult(tool_calls=[call], finish_reason="tool_calls"),
+            LLMResult(content="recovered", finish_reason="stop"),
+        ]
+    )
+
+    class CrashingMeta(StubMeta):
+        async def call(self, name: str, args: dict, version=None, timeout_s=None):
+            raise RuntimeError("control plane unreachable")
+
+    loop = build_loop(llm, CrashingMeta(), events, fake_sessionmaker)
+    result = await loop.run("create the tool")
+
+    assert result.stop_reason == "stop", "one crashing tool must not end the turn"
+    assert result.steps[0].ok is False
+    tool_rows = [content for role, content in stored if role == "tool"]
+    assert len(tool_rows) == 1, "the declaration was answered, so the history stays valid"
+    assert tool_rows[0]["tool_call_id"] == "call_dead"
+    assert "handler_raised" in tool_rows[0]["content"] or "crashed" in tool_rows[0]["content"]
+
+    # what actually goes out is valid: the calls the assistant declares are all answered
+    second = llm.requests[1]
+    declared = {
+        call["id"]
+        for message in second
+        if message["role"] == "assistant"
+        for call in message.get("tool_calls") or []
+    }
+    answered = {message["tool_call_id"] for message in second if message["role"] == "tool"}
+    assert declared == answered == {"call_dead"}

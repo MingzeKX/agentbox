@@ -246,8 +246,14 @@ def sanitize_history(
 
     # an assistant message may only declare calls that something answers
     for call_id, entry in owners.items():
-        if call_id not in answered:
-            entry["tool_calls"] = [call for call in entry.get("tool_calls", []) if call["id"] != call_id]
+        if call_id in answered:
+            continue
+        remaining = [call for call in entry.get("tool_calls", []) if call["id"] != call_id]
+        if remaining:
+            entry["tool_calls"] = remaining
+        else:
+            # no empty array either: the key is simply absent, like a plain message
+            entry.pop("tool_calls", None)
     entries = [
         entry
         for entry in entries
