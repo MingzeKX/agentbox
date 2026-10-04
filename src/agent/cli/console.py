@@ -58,6 +58,8 @@ COMMANDS: tuple[str, ...] = (
     "voice-devices",
     "speak",
     "tools",
+    "pip",
+    "archive",
     "config",
     "save",
     "sandbox",
@@ -84,6 +86,8 @@ SUBCOMMANDS: dict[str, tuple[str, ...]] = {
     "speak": ("on", "off"),
     "image": (),  # paths are typed, not completed
     "tools": ("list", "retire", "delete"),
+    "pip": ("list", "install", "persist"),
+    "archive": ("list", "get", "rm"),
     "stop": ("now",),
 }
 
@@ -99,6 +103,130 @@ TOOL_TIER_LABELS: dict[str, str] = {
 ADMIN_TOOLS_PATH = "/admin/tools"
 ADMIN_TOOLS_RETIRE_PATH = "/admin/tools/retire"
 ADMIN_TOOLS_DELETE_PATH = "/admin/tools/delete"
+
+#: the agent's long-term archive: metadata, one object, one delete (never /admin/config)
+ADMIN_ARTIFACTS_PATH = "/admin/artifacts"
+
+#: how much of one artefact /archive get prints inline
+ARCHIVE_PREVIEW_CHARS = 4000
+
+#: bytes -> "1.2 MB"; the archive quota is easier to read this way
+BYTE_UNITS: tuple[str, ...] = ("B", "KB", "MB", "GB", "TB")
+
+
+def human_bytes(size: Any) -> str:
+    """Render a byte count for a human: ``536870912`` -> ``512.0 MB``."""
+    try:
+        value = float(size or 0)
+    except (TypeError, ValueError):
+        return str(size)
+    for unit in BYTE_UNITS:
+        if value < 1024 or unit == BYTE_UNITS[-1]:
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+    return f"{value:.1f} {BYTE_UNITS[-1]}"  # pragma: no cover - the loop always returns
+
+#: the help line pip's own error messages point at (mirror + destination)
+PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
+#: the mirror apt/pip already use everywhere else in this repo
+PIP_TRUSTED_HOST = "pypi.tuna.tsinghua.edu.cn"
+
+#: where a session installs packages it was not built with.  /workspace is the only
+#: writable path in the sandbox and it is per-session, so this is the ad-hoc half; the
+#: curated packages baked into the image are the durable half.  The guest runner puts
+#: this directory on sys.path, which is what makes the next tool run able to import it.
+PIP_TARGET = "/workspace/pylibs"
+
+#: printed by the guest probe right before its JSON, so the report is unambiguous
+PIP_REPORT_MARKER = "@@PIP-LIST@@"
+
+#: byte units for /pip's total-size line
+PIP_BYTE_UNITS: tuple[str, ...] = ("B", "KB", "MB", "GB", "TB")
+
+
+def _control_rpc(method: str, params: dict[str, Any] | None = None, timeout: float = 120.0) -> dict[str, Any]:
+    """The control plane's RPC entry point, imported lazily (a test seam and no import cycle)."""
+    from agent.cli.main import _control_rpc as call
+
+    return call(method, params, timeout)
+
+
+def _pip_bytes(size: Any) -> str:
+    """``3145728`` -> ``3.0 MB``.
+
+    Kept separate from the archive helper on purpose: `/pip` must not depend on the
+    archive work landing, and both are two lines of arithmetic.
+    """
+    try:
+        value = float(size or 0)
+    except (TypeError, ValueError):
+        return str(size)
+    for unit in PIP_BYTE_UNITS:
+        if value < 1024 or unit == PIP_BYTE_UNITS[-1]:
+            return f"{int(value)} B" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} {PIP_BYTE_UNITS[-1]}"  # pragma: no cover - the loop always returns
+
+
+def _pip_probe_json(outcome: dict[str, Any]) -> dict[str, Any]:
+    """The JSON object our guest probe printed, fished out of ``exec.run``'s envelope.
+
+    The probe writes ``PIP_REPORT_MARKER`` immediately before its JSON, so pip's own chatter
+    (or a JSON-ish warning) can never be mistaken for the report: everything after the *last*
+    marker is ours.  Without it, ``rfind("{")`` would start inside a nested object
+    (``{"name": "requests", ...}``) and the report would be silently empty.
+    """
+    stdout = str(outcome.get("stdout") or "")
+    start = stdout.rfind(PIP_REPORT_MARKER)
+    if start < 0:
+        return {}
+    try:
+        parsed = json.loads(stdout[start + len(PIP_REPORT_MARKER) :].strip())
+    except ValueError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+#: the .env key the image build reads for packages that must survive a rebuild
+PIP_PERSIST_KEY = "AGENT_SANDBOX_EXTRA_PIP"
+#: how much pip output the console keeps (the tail is what matters)
+PIP_TAIL_CHARS = 4000
+
+#: what `/pip install` runs inside the session sandbox
+PIP_INDEX_FLAGS: tuple[str, ...] = ("-i", PIP_INDEX_URL, "--trusted-host", PIP_TRUSTED_HOST)
+
+#: guest-side probe for `/pip list`: installed packages + the directory's total size.
+#: The report is prefixed with PIP_REPORT_MARKER so the console can find it unambiguously.
+_PIP_LIST_PROBE = """
+import json
+import subprocess
+from pathlib import Path
+
+target = "/workspace/pylibs"
+packages = []
+try:
+    out = subprocess.run(
+        ["/usr/bin/python3", "-m", "pip", "list", "--path", target, "--format", "json", "--disable-pip-version-check"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    start = out.stdout.find("[")
+    if start >= 0:
+        packages = json.loads(out.stdout[start:])
+except Exception:
+    packages = []
+total = 0
+root = Path(target)
+if root.is_dir():
+    for path in root.rglob("*"):
+        try:
+            if path.is_file():
+                total += path.stat().st_size
+        except OSError:
+            pass
+print("@@PIP-LIST@@" + json.dumps({"packages": packages, "total_bytes": total, "target": target}))
+""".strip()
 
 #: the thinking-effort levels the gateway accepts; the order is the help order
 EFFORT_LEVELS: tuple[str, ...] = ("low", "high", "max")
@@ -200,6 +328,46 @@ COMMAND_HELP: dict[str, str] = {
 agent 能搜到/调用的工具，但同样[bold]不写 .env[/bold]（重启后仍生效）。
 
 --purge 是不可恢复的：确认提示要求你把工具名原样打一遍。""",
+    "pip": """[cyan]/pip list[/cyan]                       本会话已装在 /workspace/pylibs 的包 + 总大小
+[cyan]/pip install <包> [包2 ...][/cyan]     在当前会话的沙箱里装包（装到 /workspace/pylibs）
+[cyan]/pip persist <包> [包2 ...][/cyan]     把这些包名写进 VM 的 .env，下次重建镜像永久生效
+
+[bold]为什么分两种：[/bold]沙箱根文件系统[bold]只读[/bold]，只有 /workspace 可写，而 /workspace
+是[bold]按会话[/bold]的（换会话/换镜像就没了）。所以：
+* 临时（本会话）：[cyan]/pip install requests[/cyan] -> 装在 /workspace/pylibs，
+  来宾机的工具运行器会把它加进 sys.path，之后 import 就能用；重启沙箱 VM 仍在
+  （同一个会话的工作区会保留），换会话就没了。
+* 永久：先在 /pip install 验证能用，再 [cyan]/pip persist requests[/cyan] 写进 .env；
+  下次重建镜像（build-sandbox-image.sh 读 AGENT_SANDBOX_EXTRA_PIP）就固化进镜像。
+
+镜像里已经预装了 requests / beautifulsoup4 / lxml / pyyaml / python-dateutil / pytz /
+openpyxl / pillow / numpy / pandas（见 EXTRA_PIP），这些不需要再装。
+
+[bold]静态检查器：[/bold]工具里能 import 什么由 /config tool_import_profile 决定 ——
+strict（默认，仅标准库）、extended（上面这些预装包）、unrestricted（任意模块，
+装了第三方包就用它）。pip 命令本身是宿主侧动作，走控制平面 RPC，不碰 /admin/config。
+
+[bold]注意：[/bold]镜像是国内源（[cyan]https://pypi.tuna.tsinghua.edu.cn/simple[/cyan]）；
+沙箱默认[bold]没有网络[/bold]，需要先 [cyan]/net on[/cyan]
+（并放行 pypi.org / files.pythonhosted.org）才能下载。""",
+    "archive": """[cyan]/archive[/cyan]                        列出 AI 自己的长期存档（含总用量 / 配额）
+[cyan]/archive get <名称> [dest][/cyan]       查看/取回一个存档
+[cyan]/archive rm <名称> [版本][/cyan]        删除一个存档（不可恢复）
+
+[bold]存档在哪：[/bold]PostgreSQL 的 [cyan]artifacts[/cyan] 表（BYTEA 列），也就是 AI 服务本来就
+拥有的数据库。会话工作区是[bold]按会话[/bold]的，虚拟机重启/换镜像都会丢；AI 服务本身
+[bold]不允许碰文件系统[/bold]（有强制测试守着），所以这是它唯一能长期保存东西的地方。
+
+[cyan]/archive get notes.md[/cyan]            文本直接打印（超过 4000 字截断）
+[cyan]/archive get plot.png[/cyan]            二进制：只显示大小与 sha256
+[cyan]/archive get plot.png /workspace/p.png[/cyan]
+                                  [bold]写进沙箱[/bold] /workspace/p.png（走 AI 服务网关，
+                                  和 net.fetch 一样），随后可用 fs.read / exec.run 处理
+
+配额（[cyan]AGENT_ARCHIVE_QUOTA_BYTES[/cyan]，默认 512 MB）与单对象上限
+（[cyan]AGENT_ARCHIVE_MAX_BYTES[/cyan]，默认 8 MB）由操作员在 [cyan]/config[/cyan] 里改。
+[bold]只读：[/bold]/archive 只调用 AI 服务的 /admin/artifacts，不碰 /admin/config，
+因此列出或读取存档永远不会改写 VM 的 .env。""",
     "voice": """[cyan]/voice <音频文件>[/cyan]               把本地录音转成文字，并直接发给 agent
 [cyan]/voice-mode on[/cyan]                 [bold]实时语音模式[/bold]：按回车或 Ctrl+T 说话（/help voice-mode）
 
@@ -318,6 +486,8 @@ HELP = """
 [cyan]/voice-mode[/cyan] 实时语音：按回车或 Ctrl+T 说话，回答朗读出来     [dim](/help voice-mode)[/dim]
 [cyan]/voice-devices[/cyan] 列出麦克风 · [cyan]/speak on|off[/cyan] 朗读开关   [dim](/help voice-devices)[/dim]
 [cyan]/tools[/cyan]     注册表工具：列表 / retire / delete（不写 .env）  [dim](/help tools)[/dim]
+[cyan]/pip[/cyan]       本会话装包：list / install / persist           [dim](/help pip)[/dim]
+[cyan]/archive[/cyan]   AI 的长期存档：列表 / get / rm（不写 .env）      [dim](/help archive)[/dim]
 [cyan]/config[/cyan]    所有运行时可改的设置                          [dim](/help config)[/dim]
 [cyan]/save[/cyan]      手动把当前值再同步到 VM 的 .env（改设置时已自动写入）
 [cyan]/sandbox[/cyan]   沙箱池状态
@@ -447,6 +617,10 @@ class SlashConsole:
             "AGENT_NET_ALLOW_PORTS": values.get("net_allow_ports") or "80,443",
             "AGENT_NET_MAX_BYTES": values.get("net_max_bytes"),
             "AGENT_NET_ALLOW_PRIVATE_HOSTS": "1" if values.get("net_allow_private_hosts") else "0",
+            # archive limits: mutable through /config, so they persist like the rest
+            "AGENT_ARCHIVE_ENABLED": "1" if values.get("archive_enabled") else "0",
+            "AGENT_ARCHIVE_MAX_BYTES": values.get("archive_max_bytes"),
+            "AGENT_ARCHIVE_QUOTA_BYTES": values.get("archive_quota_bytes"),
             # /model and /think: also runtime changes, so they persist like the rest
             "AGENT_LLM_MODEL": values.get("llm_model"),
             "AGENT_LLM_EFFORT": values.get("llm_effort") or "",
@@ -534,6 +708,8 @@ class SlashConsole:
             "voice-devices": self._cmd_voice_devices,
             "speak": self._cmd_speak,
             "tools": self._cmd_tools,
+            "pip": self._cmd_pip,
+            "archive": self._cmd_archive,
             "clear": self._cmd_clear,
             "cls": self._cmd_clear,
             "session": self._cmd_session,
@@ -941,6 +1117,213 @@ class SlashConsole:
             "以及构建镜像时的 WORKSPACE_SIZE[/dim]"
         )
 
+    # ------------------------------------------------------------------------ pip
+    def _sandbox_session(self) -> str:
+        """The session whose sandbox the pip commands act on.
+
+        The AI service names its sessions ``s-<hex>``; the console learns the id from the
+        chat stream, so before the first turn there is none yet and ``default`` is used --
+        the control plane binds a VM per session id, so either way the operator gets a
+        real, live sandbox.
+        """
+        return str(self.state.session_id or "default")
+
+    def _sandbox_exec(self, argv: list[str], *, timeout: float = 300.0) -> dict[str, Any]:
+        """Run one command in the session sandbox through the control plane.
+
+        Deliberately RPC (``sandbox.invoke`` -> guest ``exec.run``) and never
+        ``/admin/config``: installing a package must not rewrite the VM's ``.env``.
+        """
+        try:
+            body = _control_rpc(
+                "sandbox.invoke",
+                {
+                    "session_id": self._sandbox_session(),
+                    "kind": "native",
+                    "method": "exec.run",
+                    "params": {"argv": list(argv), "cwd": "/workspace", "timeout_s": timeout},
+                },
+                timeout=timeout + 60.0,
+            )
+        except SystemExit as exc:  # _control_rpc raises SystemExit when the plane is down
+            raise RuntimeError(
+                f"控制平面不可达（{exc}）。沙箱装包必须经过控制平面 —— "
+                "确认控制平面在跑：.\\start-agent.cmd，或 .\\.venv\\Scripts\\python -m agent.cli serve control"
+            ) from exc
+        outcome = (body or {}).get("result") or {}
+        if not isinstance(outcome, dict):
+            raise RuntimeError(f"沙箱返回了意外的结果：{str(outcome)[:200]}")
+        if not outcome.get("ok"):
+            raise RuntimeError(
+                f"沙箱调用失败：{str(outcome.get('error') or outcome.get('error_code') or outcome)[:300]}"
+            )
+        return outcome
+
+    @staticmethod
+    def _pip_output(console: Console, outcome: dict[str, Any]) -> None:
+        """Print pip's own output verbatim (no markup, so ``[..]`` in logs cannot break)."""
+        result = outcome.get("result") if isinstance(outcome.get("result"), dict) else outcome
+        text = str((result or {}).get("stdout") or "") + "\n" + str((result or {}).get("stderr") or "")
+        # our own probe report is not something a human wants to read
+        cut = text.rfind(PIP_REPORT_MARKER)
+        if cut >= 0:
+            text = text[:cut]
+        text = text.strip()
+        if len(text) > PIP_TAIL_CHARS:
+            text = "...（前面的输出已省略）\n" + text[-PIP_TAIL_CHARS:]
+        if text:
+            console.print(text, markup=False, highlight=False)
+
+    def _env_value(self, name: str) -> str | None:
+        """Read one key out of the platform VM's ``.env`` over ssh.
+
+        Returns ``None`` when it is unset or unreadable; the caller then says so instead
+        of silently dropping what was there before.
+        """
+        ssh = Path("C:/Windows/System32/OpenSSH/ssh.exe")
+        key = project_root() / "var" / "vm_key"
+        if not ssh.is_file() or not key.is_file():
+            return None
+        remote = f"grep -h '^{name}=' .env | tail -1 | cut -d= -f2-"
+        result = subprocess.run(  # noqa: S603 - fixed binary, explicit argv
+            [
+                str(ssh),
+                "-i",
+                str(key),
+                "-p",
+                "2222",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=NUL",
+                "-o",
+                "LogLevel=ERROR",
+                "agent@127.0.0.1",
+                f"cd /opt/agentbox/app && {remote}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        value = (result.stdout or "").strip()
+        return value or None
+
+    def _cmd_pip(self, args: list[str]) -> None:
+        """Install packages into this session's sandbox -- host side, over the control plane."""
+        action = args[0].lower() if args else "list"
+        if action == "list":
+            self._pip_list()
+            return
+        if action == "install":
+            self._pip_install(args[1:])
+            return
+        if action == "persist":
+            self._pip_persist(args[1:])
+            return
+        raise RuntimeError(
+            "用法：/pip list | /pip install <包> [包2 ...] | /pip persist <包> [包2 ...]"
+        )
+
+    def _pip_list(self) -> None:
+        outcome = self._sandbox_exec(["/usr/bin/python3", "-c", _PIP_LIST_PROBE], timeout=120.0)
+        self._pip_output(self.console, outcome)
+        # exec.run answers with {exit_code, stdout, stderr, timed_out, ...}; the probe's own
+        # JSON report is what our script printed, so parse THAT, not the envelope.
+        report = _pip_probe_json(outcome)
+        packages = [item for item in report.get("packages") or [] if isinstance(item, dict)]
+        table = Table(title=f"本会话已装包（{PIP_TARGET}，共 {_pip_bytes(report.get('total_bytes') or 0)}）")
+        table.add_column("包", style="cyan")
+        table.add_column("版本")
+        for item in packages:
+            table.add_row(str(item.get("name")), str(item.get("version")))
+        if not packages:
+            self.console.print(f"[dim]{PIP_TARGET} 里还没有包 —— 用 [cyan]/pip install <包>[/cyan] 装[/dim]")
+            self.console.print("[dim]镜像里已预装 requests / pandas / lxml 等，不需要再装[/dim]")
+            return
+        self.console.print(table)
+        self.console.print(
+            "[dim]这些包随会话工作区存在；换会话就没了。要永久生效：[cyan]/pip persist <包>[/cyan]，"
+            "然后重建镜像[/dim]"
+        )
+
+    @staticmethod
+    def _pip_names(values: list[str]) -> list[str]:
+        """Package names from a typed command: spaces and commas both separate them."""
+        names: list[str] = []
+        for item in values:
+            for name in str(item).replace(",", " ").split():
+                if name and name not in names:
+                    names.append(name)
+        return names
+
+    def _pip_install(self, names: list[str]) -> None:
+        names = self._pip_names(names)
+        if not names:
+            raise RuntimeError("用法：/pip install <包> [包2 ...]")
+        argv = [
+            "/usr/bin/python3",
+            "-m",
+            "pip",
+            "install",
+            "--no-cache-dir",
+            "--target",
+            PIP_TARGET,
+            *PIP_INDEX_FLAGS,
+            *names,
+        ]
+        self.console.print(f"[dim]在沙箱 {self._sandbox_session()} 里执行：{' '.join(argv)}[/dim]")
+        outcome = self._sandbox_exec(argv, timeout=300.0)
+        self._pip_output(self.console, outcome)
+        if int(outcome.get("exit_code") or 0) != 0:
+            self._pip_failure(outcome, names)
+            return
+        self.console.print(
+            f"[green]已装到 {PIP_TARGET}[/green]（本会话有效）——"
+            "工具运行器会把它加进 sys.path，下一步："
+            f"[cyan]/pip persist {' '.join(names)}[/cyan] 可让它进下一个镜像"
+        )
+
+    def _pip_failure(self, result: dict[str, Any], names: list[str]) -> None:
+        """Turn pip's exit code into the real reason plus the one thing to change."""
+        combined = f"{result.get('stdout') or ''}\n{result.get('stderr') or ''}".lower()
+        hints = []
+        if result.get("timed_out"):
+            hints.append("pip 超时（默认 300 s）；大包请重试或先 /pip persist 再重建镜像")
+        if "no matching distribution" in combined or "could not find a version" in combined:
+            hints.append(f"源里没有这个包：换名字，或用 /pip persist 让镜像构建时再试（镜像 {PIP_INDEX_URL}）")
+        if "temporary failure in name resolution" in combined or "network is unreachable" in combined:
+            hints.append("沙箱没有网络：先 /net on，并 /net allow pypi.org,files.pythonhosted.org")
+        if "permission denied" in combined:
+            hints.append(f"写不进 {PIP_TARGET}：检查 /workspace 是否可写")
+        if not hints:
+            hints.append(f"看上面的 pip 输出；也可以用 /pip persist {' '.join(names)} 在重建镜像时安装")
+        self.err.print(f"[red]装包失败（exit {result.get('exit_code')}）：{'；'.join(hints)}[/red]")
+
+    def _pip_persist(self, names: list[str]) -> None:
+        names = self._pip_names(names)
+        if not names:
+            raise RuntimeError("用法：/pip persist <包> [包2 ...]")
+        # merge with whatever is already persisted, so /pip persist does not silently
+        # drop the packages an earlier run asked for
+        current = self._env_value(PIP_PERSIST_KEY)
+        merged: list[str] = []
+        for item in [*self._pip_names([current or ""]), *names]:
+            if item and item not in merged:
+                merged.append(item)
+        self._persist({PIP_PERSIST_KEY: " ".join(merged)})
+        self.console.print(f"[green]已写入 VM 的 .env：{PIP_PERSIST_KEY}={(' '.join(merged))}[/green]")
+        self.console.print(
+            "[bold]下次重建镜像即永久生效[/bold]："
+            "[cyan]sudo bash /opt/agentbox/app/deploy/sandbox/build-sandbox-image.sh[/cyan]"
+            "（脚本读 AGENT_SANDBOX_EXTRA_PIP，和 EXTRA_PIP 一样装进镜像）"
+        )
+        if current is None:
+            self.console.print("[yellow]注意：没能读到 .env 里已有的值，这次是覆盖写；请核对上面的列表[/yellow]")
+        self.console.print(
+            f"[dim]要现在就用：/pip install {' '.join(names)}（装在 {PIP_TARGET}，本会话有效）[/dim]"
+        )
+
     # ------------------------------------------------------------------------ log
     def _cmd_log(self, args: list[str]) -> None:
         if not args:
@@ -1012,6 +1395,8 @@ class SlashConsole:
         try:
             if method == "POST":
                 response = httpx.post(url, headers=self._headers(), json=payload or {}, timeout=30.0)
+            elif method == "DELETE":
+                response = httpx.delete(url, headers=self._headers(), timeout=30.0)
             else:
                 response = httpx.get(url, headers=self._headers(), timeout=30.0)
         except httpx.HTTPError as exc:
@@ -1138,6 +1523,120 @@ class SlashConsole:
             )
             return
         raise RuntimeError("用法：/tools [list] | /tools retire <名称> [版本] | /tools delete <名称> [版本] [--purge]")
+
+    # -------------------------------------------------------------------- archive
+    def _archive_summary(self, body: dict[str, Any]) -> str:
+        """The one-line usage footer shared by list/get/rm."""
+        usage = body.get("usage_bytes")
+        quota = body.get("quota_bytes")
+        if usage is None:
+            return ""
+        text = f"用量 {human_bytes(usage)}"
+        if quota:
+            percent = (float(usage) / float(quota) * 100) if quota else 0.0
+            text += f" / 配额 {human_bytes(quota)}（{percent:.1f}%）"
+        return text
+
+    def _archive_table(self, rows: list[dict[str, Any]]) -> Table:
+        """Metadata only: the payload of an artefact never travels to the console."""
+        table = Table(title=f"AI 长期存档（{len(rows)}）", title_justify="left")
+        table.add_column("名称", style="cyan")
+        table.add_column("版本", justify="right")
+        table.add_column("大小", justify="right")
+        table.add_column("类型")
+        table.add_column("sha256", style="dim")
+        table.add_column("更新时间", style="dim")
+        table.add_column("说明", style="dim")
+        for row in rows:
+            table.add_row(
+                str(row.get("name") or "?"),
+                f"v{row.get('version', '?')}",
+                human_bytes(row.get("size_bytes")),
+                str(row.get("media_type") or ""),
+                str(row.get("sha256") or "")[:12],
+                str(row.get("updated_at") or "").replace("T", " ")[:19],
+                str(row.get("note") or "")[:40],
+            )
+        return table
+
+    def _cmd_archive(self, args: list[str]) -> None:
+        """The agent's long-term archive: list / get / rm -- never through /admin/config."""
+        action = args[0].lower() if args else "list"
+        if action == "list":
+            body = self._admin_request(ADMIN_ARTIFACTS_PATH)
+            rows = list(body.get("artifacts") or [])
+            if not rows:
+                self.console.print("[dim]存档还是空的：agent 用 archive.put 存东西[/dim]")
+            else:
+                self.console.print(self._archive_table(rows))
+            self.console.print(f"[dim]{self._archive_summary(body)}（只读查询，不写 .env）[/dim]")
+            return
+        if action == "get":
+            if len(args) < 2:
+                raise RuntimeError("用法：/archive get <名称> [dest]")
+            name = args[1]
+            # a destination is a SANDBOX path, the same convention as net.fetch: an
+            # explicit /workspace/... is used as given, a bare path is relative to
+            # /workspace/downloads (the AI service resolves it and does the write)
+            dest = args[2] if len(args) > 2 else None
+            path = f"{ADMIN_ARTIFACTS_PATH}/{name}"
+            if dest:
+                from urllib.parse import quote
+
+                path += f"?dest={quote(dest, safe='')}"
+            body = self._admin_request(path)
+            size = human_bytes(body.get("size_bytes"))
+            if dest and body.get("saved"):
+                saved = body["saved"]
+                self.console.print(
+                    f"[green]已写入沙箱 {saved.get('path')}[/green]"
+                    f"（{human_bytes(saved.get('bytes'))}，sha256 {str(body.get('sha256') or '')[:12]}）"
+                )
+                self.console.print("[dim]接下来可用 fs.read / exec.run 处理这个路径[/dim]")
+                return
+            if body.get("content") is not None:
+                text = str(body["content"])
+                preview = text[:ARCHIVE_PREVIEW_CHARS]
+                self.console.print(
+                    Panel(
+                        preview,
+                        title=f"{name} v{body.get('version', '?')} · {size} · {body.get('media_type', '')}",
+                        border_style="cyan",
+                    )
+                )
+                if len(text) > ARCHIVE_PREVIEW_CHARS:
+                    self.console.print(
+                        f"[dim]内容已截断到 {ARCHIVE_PREVIEW_CHARS} 字（完整长度 {len(text)}）；"
+                        "用 /archive get <名称> /workspace/<文件> 写入沙箱后处理[/dim]"
+                    )
+                return
+            # binary: never dump base64 into the terminal
+            self.console.print(
+                f"[bold]{name}[/bold] v{body.get('version', '?')} · {size} · "
+                f"{body.get('media_type', '')} · sha256 {str(body.get('sha256') or '')[:12]}"
+            )
+            self.console.print(
+                f"[dim]二进制内容不直接打印；用 [/dim][cyan]/archive get {name} /workspace/{name}[/cyan]"
+                "[dim] 写入沙箱再处理[/dim]"
+            )
+            return
+        if action in {"rm", "delete"}:
+            if len(args) < 2:
+                raise RuntimeError("用法：/archive rm <名称> [版本]")
+            name = args[1]
+            version = _version_argument(args[2] if len(args) > 2 else None)
+            path = f"{ADMIN_ARTIFACTS_PATH}/{name}"
+            if version is not None:
+                path += f"?version={version}"
+            body = self._admin_request(path, method="DELETE")
+            removed = body.get("removed") or []
+            versions = "、".join(f"v{item.get('version')}" for item in removed) or f"v{version}"
+            self.console.print(
+                f"[green]已删除 {name} {versions}[/green]（释放 {human_bytes(body.get('freed_bytes'))}，"
+                f"{self._archive_summary(body)}）"
+            )
+            return
+        raise RuntimeError("用法：/archive [list] | /archive get <名称> [dest] | /archive rm <名称> [版本]")
 
     def _confirm_purge(self, name: str) -> None:
         """Hard delete asks for the tool name back -- the same shape as /perm unrestricted."""
