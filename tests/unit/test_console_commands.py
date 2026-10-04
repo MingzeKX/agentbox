@@ -881,8 +881,20 @@ def test_tools_delete_purge_needs_the_name_typed_back(shell, registry):
 
     call = registry[-1]
     assert call["url"].endswith("/admin/tools/delete")
+    # the API refuses a hard purge without confirm=true, and the console must send it --
+    # an operator "delete does nothing" report is exactly what a missing flag looks like
     assert call["json"] == {"name": "word_count", "version": 2, "purge": True, "confirm": True}
     assert "已彻底删除" in output(console)
+
+
+def test_tools_soft_delete_sends_no_purge_and_no_confirm(shell, registry):
+    sh, console, _ = shell
+
+    assert sh.handle("/tools delete word_count") is True
+
+    call = registry[-1]
+    assert call["json"] == {"name": "word_count", "version": 2, "purge": False, "confirm": True}
+    assert "已删除" in output(console) and "彻底" not in output(console)
 
 
 def test_tools_delete_purge_aborts_when_the_name_does_not_match(shell, registry):

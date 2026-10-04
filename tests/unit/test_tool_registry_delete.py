@@ -9,6 +9,7 @@ wrong column, a wrong operator or a wrong ``rowcount`` still fails the test.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
 from typing import Any
@@ -432,7 +433,7 @@ async def test_hard_delete_removes_the_row_and_keeps_the_run_ledger():
     # v2 still exists, so its runs stay visible per-tool; only the deleted version's
     # orphaned run drops out (recent_runs INNER JOINs tools on tool_id)
     assert sorted(row.id for row in await repo.recent_runs(session, "upper_text")) == [2, 3]
-    assert session.run_sync_calls == 1, "the tombstone table is ensured before it is written to"
+    assert session.run_sync_calls == 2, "tombstone table + ledger-unlink repair, both before use"
 
 
 @pytest.mark.asyncio
@@ -478,6 +479,111 @@ def test_ledger_columns_stay_a_kept_history():
     assert tool_run.c.tool_id.nullable is True
     assert {fk.ondelete for fk in tool_run.c.tool_id.foreign_keys} == {"SET NULL"}
     assert "tool_tombstones" in ToolTombstone.metadata.tables
+
+
+class FakeSyncSession:
+    def __init__(self, connection: Any) -> None:
+        self._connection = connection
+
+    def connection(self) -> Any:
+        return self._connection
+
+
+class FakeDdlSession:
+    """Enough of an AsyncSession for a ``run_sync`` DDL guard."""
+
+    def __init__(self, connection: Any) -> None:
+        self._connection = connection
+
+    async def run_sync(self, fn: Any) -> None:
+        fn(FakeSyncSession(self._connection))
+
+
+class FakeScalar:
+    def __init__(self, value: Any) -> None:
+        self._value = value
+
+    def scalar(self) -> Any:
+        return self._value
+
+
+class FakeConnection:
+    """Records the DDL a guard issues and answers the foreign-key definition query."""
+
+    def __init__(self, definition: str) -> None:
+        self.statements: list[str] = []
+        self.definition = definition
+
+    def exec_driver_sql(self, statement: str, parameters: Any = None) -> Any:  # noqa: ARG002
+        collapsed = " ".join(statement.split())
+        self.statements.append(collapsed)
+        if collapsed.lower().startswith("select"):
+            return FakeScalar(self.definition)
+        return None
+
+
+def test_a_hard_delete_repairs_a_ledger_that_cannot_be_unlinked():
+    """A database from before the ledger became history has tool_id NOT NULL.
+
+    Live failure (real traceback from the platform VM)::
+
+        IntegrityError: null value in column "tool_id" of relation "tool_runs"
+        violates not-null constraint
+        [SQL: UPDATE tool_runs SET tool_id=$1::VARCHAR, ...]
+
+    The admin API answered HTTP 500 with an empty body, so the operator's
+    ``/tools delete <name> --purge`` looked like it did nothing while retire worked.
+    ``create_all`` never alters an existing table, so the delete path has to.
+    """
+    connection = FakeConnection("FOREIGN KEY (tool_id) REFERENCES tools(id) ON DELETE CASCADE")
+
+    asyncio.run(repo._ensure_ledger_unlinkable(FakeDdlSession(connection)))  # type: ignore[arg-type]
+
+    joined = "\n".join(connection.statements)
+    assert "ALTER TABLE tool_runs ALTER COLUMN tool_id DROP NOT NULL" in joined
+    assert "DROP CONSTRAINT tool_runs_tool_id_fkey" in joined
+    assert "ADD CONSTRAINT tool_runs_tool_id_fkey" in joined
+    assert "ON DELETE SET NULL" in joined, "the ledger is kept, only the reference is dropped"
+
+
+def test_a_hard_delete_leaves_an_already_correct_ledger_alone():
+    connection = FakeConnection("FOREIGN KEY (tool_id) REFERENCES tools(id) ON DELETE SET NULL")
+
+    asyncio.run(repo._ensure_ledger_unlinkable(FakeDdlSession(connection)))  # type: ignore[arg-type]
+
+    assert any("DROP NOT NULL" in statement for statement in connection.statements), (
+        "DROP NOT NULL is idempotent and always safe"
+    )
+    assert not any("ADD CONSTRAINT" in statement for statement in connection.statements), (
+        "an already SET NULL foreign key is not rewritten"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_delete_path_repairs_the_ledger_before_unlinking():
+    """The repair must happen *inside* delete_tool, before the UPDATE that needs it."""
+    session = FakeRegistrySession()
+    session.seed(make_tool(version=1))
+    order: list[str] = []
+    original = repo._ensure_ledger_unlinkable
+
+    async def spy(target):
+        order.append("guard")
+        return await original(target)
+
+    real_execute = session.execute
+
+    async def execute(stmt):
+        if isinstance(stmt, Update) and _target_class(stmt) is ToolRun:
+            order.append("unlink")
+        return await real_execute(stmt)
+
+    session.execute = execute  # type: ignore[method-assign]
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(repo, "_ensure_ledger_unlinkable", spy)
+        assert await repo.delete_tool(session, "upper_text", 1, hard=True) == 1
+
+    assert order == ["guard", "unlink"], "the column is repaired before it is set to NULL"
 
 
 def test_tombstone_columns_carry_the_audit_fields():

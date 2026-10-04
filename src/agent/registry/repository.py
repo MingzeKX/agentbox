@@ -201,6 +201,41 @@ async def _ensure_tombstone_table(session: AsyncSession) -> None:
     await session.run_sync(lambda _sync_session: _create(_sync_session.connection()))
 
 
+async def _ensure_ledger_unlinkable(session: AsyncSession) -> None:
+    """Bring ``tool_runs.tool_id`` in line with the model before a hard delete.
+
+    ``init_db`` uses ``Base.metadata.create_all``, which creates missing tables but never
+    alters an existing one.  A database created before the run ledger became audit history
+    still has ``tool_id NOT NULL`` and ``ON DELETE CASCADE``.  On such a database the
+    unlink below failed outright::
+
+        IntegrityError: null value in column "tool_id" of relation "tool_runs"
+        violates not-null constraint
+
+    which surfaced as HTTP 500 from ``POST /admin/tools/delete`` -- i.e. the operator saw
+    "hard delete does nothing" while retire kept working -- and a plain ``DELETE`` would
+    have taken the whole run history with it.
+
+    Both statements are idempotent: ``DROP NOT NULL`` on an already-nullable column is a
+    no-op, and the foreign key is only rewritten when it is not already ``SET NULL``.
+    """
+
+    def _fix(connection: Any) -> None:
+        connection.exec_driver_sql("ALTER TABLE tool_runs ALTER COLUMN tool_id DROP NOT NULL")
+        definition = connection.exec_driver_sql(
+            "select pg_get_constraintdef(oid) from pg_constraint "
+            "where conrelid = 'tool_runs'::regclass and conname = 'tool_runs_tool_id_fkey'"
+        ).scalar()
+        if definition and "SET NULL" not in str(definition):
+            connection.exec_driver_sql("ALTER TABLE tool_runs DROP CONSTRAINT tool_runs_tool_id_fkey")
+            connection.exec_driver_sql(
+                "ALTER TABLE tool_runs ADD CONSTRAINT tool_runs_tool_id_fkey "
+                "FOREIGN KEY (tool_id) REFERENCES tools(id) ON DELETE SET NULL"
+            )
+
+    await session.run_sync(lambda _sync_session: _fix(_sync_session.connection()))
+
+
 async def delete_tool(
     session: AsyncSession,
     name: str,
@@ -230,6 +265,11 @@ async def delete_tool(
       once the id is already NULL.  ``recent_runs`` joins on ``Tool``, so orphaned
       rows are no longer listed per-tool -- they remain in the database (and in the
       tombstone counters) rather than being erased.
+    * :func:`_ensure_ledger_unlinkable` first repairs a database whose ``tool_id`` is
+      still ``NOT NULL``; otherwise the unlink above raises and the delete looks like a
+      no-op to the operator.  The ledger is audit history, so the choice is "keep the
+      rows, drop the reference" (SET NULL) rather than "delete the history with the
+      tool" (CASCADE).
 
     The rows are deleted with :func:`sqlalchemy.delete` (not ORM cascade), so no
     ``Tool`` object has to be loaded.
@@ -245,6 +285,9 @@ async def delete_tool(
         return 0
 
     await _ensure_tombstone_table(session)
+    # a database from before the ledger became audit history cannot hold a NULL tool_id,
+    # which is exactly what unlinking the runs needs
+    await _ensure_ledger_unlinkable(session)
     ids = [row.id for row in rows]
     now = datetime.now(UTC)
 

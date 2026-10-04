@@ -37,6 +37,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import SQLAlchemyError
 
 from agent.ai.agent_loop import AgentLoop
 from agent.ai.llm import (
@@ -400,11 +401,22 @@ def create_app() -> FastAPI:
             missing = await _admin_tool_exists(session, {"name": name})
             if missing is not None:
                 return missing
-            deleted = await repo.delete_tool(
-                session, name, version, hard=purge, deleted_by="operator", reason=str(body.get("reason") or "")
-            )
-            remaining = await _admin_tool_remaining(session, name)
-            await session.commit()
+            try:
+                deleted = await repo.delete_tool(
+                    session, name, version, hard=purge, deleted_by="operator", reason=str(body.get("reason") or "")
+                )
+                remaining = await _admin_tool_remaining(session, name)
+                await session.commit()
+            except SQLAlchemyError as exc:
+                # an unchanged database can refuse the delete (e.g. tool_runs.tool_id was
+                # NOT NULL); a bare 500 with an empty body told the operator nothing, so
+                # the reason is logged and returned as JSON
+                await session.rollback()
+                log.exception("hard delete of %s failed", name)
+                return JSONResponse(
+                    {"ok": False, "error": f"database refused the delete: {type(exc).__name__}: {exc}"},
+                    status_code=409,
+                )
         return JSONResponse(
             {
                 "ok": True,
