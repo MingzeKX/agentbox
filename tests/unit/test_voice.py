@@ -1253,6 +1253,13 @@ def test_recorder_without_sounddevice_raises_chinese(no_sounddevice):
 
 
 def test_voice_loop_hands_free_records_until_ctrl_c(monkeypatch):
+    """Ctrl-C while waiting for speech *ends* hands-free mode -- it must not spin.
+
+    Regression: the loop used to read that Ctrl-C as "cancel this recording and ask
+    again", but hands-free mode never asks (there is no prompt to return to), so it
+    re-recorded forever and printed 录音中/已取消 at ~830 KB per second.  That avalanche
+    is what stalled the whole suite: pytest's terminal flush blocked on it.
+    """
     monkeypatch.setattr(settings, "voice_tts", False)
     monkeypatch.setattr("time.sleep", lambda _seconds: None)
     console = quiet_console()
@@ -1279,10 +1286,17 @@ def test_voice_loop_hands_free_records_until_ctrl_c(monkeypatch):
         speak_fn=lambda text: True,
         hands_free=True,
     )
+    out = console.export_text()
 
     assert mode == "off"
-    assert calls["count"] == 3
-    assert "免提模式" in console.export_text()
+    assert calls["count"] == 3, "the third Ctrl-C ended the loop instead of starting a 4th capture"
+    assert "免提模式" in out
+    assert "已退出语音模式" in out
+    assert "已取消这次录音" not in out, "hands-free has no prompt to cancel back to"
+    # the proof that it stopped rather than looping: exactly one recording line per
+    # attempt (3), not an unbounded stream of them
+    assert out.count(RECORDING_MESSAGE) == calls["count"] == 3
+    assert len(out) < 500, "a runaway loop is what stalled the suite; keep this output tiny"
 
 
 # ------------------------------------------------------------ console commands

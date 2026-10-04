@@ -16,6 +16,7 @@ model can fix the source and call again.
 from __future__ import annotations
 
 import base64
+import json
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -36,6 +37,79 @@ from agent.models.tool import (
 from agent.registry import repository as repo
 
 log = logging.getLogger(__name__)
+
+#: What may travel back to the model from a gate, and therefore into the session history.
+#: ``tool.test`` returns one entry per case carrying the tool's own output, and ``actual``
+#: is whatever the tool returned -- unbounded.  A handful of failing cases with large
+#: payloads used to put hundreds of kilobytes into the conversation, and because history is
+#: replayed on every later turn that is a session-wide problem, not a display one.
+TOOLSMITH_CASE_MAX_CHARS = 400
+TOOLSMITH_CASES_REPORTED = 10
+TOOLSMITH_TEXT_MAX_CHARS = 4_000
+TOOLSMITH_VIOLATIONS_REPORTED = 20
+#: where the guest keeps the full per-case transcript of the last ``tool.test`` run
+TOOLSMITH_TEST_LOG_PATH = "/workspace/tool-tests.log"
+
+
+def _clip(value: Any, limit: int = TOOLSMITH_TEXT_MAX_CHARS) -> str:
+    """A bounded rendering of anything a gate produced."""
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            text = str(value)
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def _case_summary(entry: dict[str, Any]) -> dict[str, Any]:
+    summary = {
+        "name": str(entry.get("name") or "case"),
+        "ok": bool(entry.get("ok")),
+        "message": _clip(entry.get("message") or "", TOOLSMITH_CASE_MAX_CHARS),
+    }
+    if entry.get("actual") is not None:
+        summary["actual"] = _clip(entry["actual"], TOOLSMITH_CASE_MAX_CHARS)
+    return summary
+
+
+def _slim_tests(result: dict[str, Any]) -> dict[str, Any]:
+    """Counts and failing case names, never the whole transcript.
+
+    ``log_path`` points at the guest-side file holding every line of every case, so the
+    model can still go and read the detail without it entering the conversation.
+    """
+    cases = [entry for entry in (result.get("results") or []) if isinstance(entry, dict)]
+    reported = [_case_summary(entry) for entry in cases[:TOOLSMITH_CASES_REPORTED]]
+    failed_names = [str(entry.get("name") or "case") for entry in cases if not entry.get("ok")]
+    slim: dict[str, Any] = {
+        "passed": result.get("passed", 0),
+        "failed": result.get("failed", 0),
+        "failed_cases": failed_names[:TOOLSMITH_CASES_REPORTED],
+        "results": reported,
+    }
+    if len(cases) > len(reported):
+        slim["results_note"] = f"只回显前 {len(reported)} 个用例（共 {len(cases)} 个）"
+    log_path = str(result.get("log_path") or "")
+    if log_path:
+        slim["log_path"] = log_path
+    return slim
+
+
+def _slim_violations(violations: Any) -> list[dict[str, Any]]:
+    """Findings must stay actionable: keep the rule, the line and a bounded message."""
+    out: list[dict[str, Any]] = []
+    for item in (violations or [])[:TOOLSMITH_VIOLATIONS_REPORTED]:
+        if not isinstance(item, dict):
+            continue
+        entry = dict(item)
+        if "message" in entry:
+            entry["message"] = _clip(entry["message"], TOOLSMITH_CASE_MAX_CHARS)
+        out.append(entry)
+    return out
 
 
 @dataclass
@@ -117,10 +191,14 @@ async def _static_check(ctx: ToolsmithContext, manifest: ToolManifest) -> dict[s
         return {
             "stage": "static_check",
             "error": "static analysis rejected the source",
-            "violations": result.get("violations") or [],
+            "violations": _slim_violations(result.get("violations")),
             "stats": result.get("stats") or {},
         }
-    return {"ok": True, "stats": result.get("stats") or {}, "violations": result.get("violations") or []}
+    return {
+        "ok": True,
+        "stats": result.get("stats") or {},
+        "violations": _slim_violations(result.get("violations")),
+    }
 
 
 async def _run_tests(ctx: ToolsmithContext, manifest: ToolManifest) -> dict[str, Any]:
@@ -145,11 +223,7 @@ async def _run_tests(ctx: ToolsmithContext, manifest: ToolManifest) -> dict[str,
     if not payload.ok or not isinstance(payload.result, dict):
         return {"stage": "sandbox_tests", "error": payload.error or "test run failed"}
     result = payload.result
-    outcome: dict[str, Any] = {
-        "passed": result.get("passed", 0),
-        "failed": result.get("failed", 0),
-        "results": result.get("results") or [],
-    }
+    outcome: dict[str, Any] = _slim_tests(result)
     if not result.get("ok"):
         outcome["error"] = "one or more sandbox test cases failed"
         outcome["stage"] = "sandbox_tests"
@@ -176,7 +250,9 @@ async def check(ctx: ToolsmithContext, args: dict[str, Any]) -> dict[str, Any]:
             "ok": True,
             "stage": "ready",
             "stats": statics["stats"],
-            "warnings": [v for v in statics.get("violations", []) if v.get("severity") == "warning"],
+            "warnings": _slim_violations(
+                [v for v in statics.get("violations", []) if v.get("severity") == "warning"]
+            ),
             "tests": {k: tests.get(k) for k in ("passed", "failed")} if tests else {"passed": 0, "failed": 0},
             "next": "call toolsmith.create with the exact same body to register it",
         }

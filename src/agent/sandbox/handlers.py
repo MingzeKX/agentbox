@@ -500,12 +500,78 @@ class Methods:
                 passed += 1
             else:
                 failed += 1
-        return {"passed": passed, "failed": failed, "results": results, "ok": failed == 0 and passed > 0}
+        log_path = _write_test_log(name, version, results, passed, failed)
+        # the model needs the verdict and the failing case names, not every transcript:
+        # whatever we return here ends up in the conversation *and* in the session history,
+        # which is replayed on every later turn
+        return {
+            "passed": passed,
+            "failed": failed,
+            "results": [_case_summary(entry) for entry in results],
+            "log_path": log_path,
+            "ok": failed == 0 and passed > 0,
+        }
 
 
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
+
+
+def _case_summary(entry: dict[str, Any], limit: int = 400) -> dict[str, Any]:
+    """One test case, as the model should see it: verdict + a bounded message.
+
+    ``actual`` is whatever the tool returned, which is unbounded; it is clipped here so a
+    verbose case cannot flood the conversation (and the session history that replays it).
+    """
+
+    def clip(value: Any) -> str:
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+        return text if len(text) <= limit else text[: limit - 1] + "…"
+
+    summary: dict[str, Any] = {
+        "name": str(entry.get("name") or "case"),
+        "ok": bool(entry.get("ok")),
+        "message": clip(entry.get("message") or ""),
+        "duration_ms": entry.get("duration_ms", 0),
+    }
+    if entry.get("actual") is not None:
+        summary["actual"] = clip(entry["actual"])
+    stderr = str(entry.get("stderr") or "").strip()
+    if not entry.get("ok") and stderr:
+        summary["stderr"] = clip(stderr)
+    return summary
+
+
+def _write_test_log(
+    name: str, version: int, results: list[dict[str, Any]], passed: int, failed: int
+) -> str:
+    """Keep every case's full transcript in the workspace, return its path.
+
+    The conversation gets the summary; the detail stays retrievable (``fs.read`` on the
+    returned path) without being replayed into every later turn.
+    """
+    path = os.path.join(policy.WORKSPACE, "tool-tests.log")
+    try:
+        os.makedirs(policy.WORKSPACE, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(f"# {name} v{version}: {passed} passed, {failed} failed\n")
+            for entry in results:
+                handle.write(
+                    f"\n== {entry.get('name')} :: {'ok' if entry.get('ok') else 'FAILED'}"
+                    f" ({entry.get('duration_ms', 0)} ms) ==\n"
+                )
+                handle.write(f"message: {entry.get('message')}\n")
+                handle.write(f"actual : {json.dumps(entry.get('actual'), ensure_ascii=False, default=str)}\n")
+                if entry.get("stdout"):
+                    handle.write(f"--- stdout ---\n{entry['stdout']}\n")
+                if entry.get("stderr"):
+                    handle.write(f"--- stderr ---\n{entry['stderr']}\n")
+        _chown_to_sandbox(path)
+    except OSError as exc:  # pragma: no cover - the workspace is normally writable
+        sys.stderr.write(f"could not write the tool test log: {exc}\n")
+        return ""
+    return path
 
 
 def _decode_source(params: dict[str, Any]) -> str:

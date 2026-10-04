@@ -13,6 +13,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent.ai import personas
+from agent.ai.history import HISTORY_MESSAGE_MAX_CHARS, drop_leading_orphans, for_history, truncate_for_history
 from agent.ai.llm import LLMClient, LLMError
 from agent.ai.metacalls import MetaTools
 from agent.config import settings
@@ -113,15 +114,21 @@ class AgentLoop:
     async def history(self) -> list[dict[str, Any]]:
         async with self.sessionmaker() as session:
             rows = await repo.load_messages(session, self.session_id, limit=settings.max_history_messages)
-        return [row.content for row in rows if isinstance(row.content, dict)]
+        # newest-first window -> a boundary can split a tool_call/tool result pair; the
+        # window must never start with the `tool` half of one
+        return drop_leading_orphans([row.content for row in rows if isinstance(row.content, dict)])
 
     async def _persist(self, role: str, message: dict[str, Any]) -> None:
         async with self.sessionmaker() as session:
             await repo.ensure_session(session, self.session_id)
-            await repo.append_message(session, self.session_id, role, message)
+            # stored in its *storable* form: text only and capped, so a screenshot or a
+            # 3 MB `pip install` transcript can never be replayed on every later turn
+            await repo.append_message(session, self.session_id, role, for_history(message))
             await session.commit()
 
-    async def run(self, user_message: str, system_extra: str | None = None) -> TurnResult:
+    async def run(
+        self, user_message: str | list[dict[str, Any]], system_extra: str | None = None
+    ) -> TurnResult:
         started = time.monotonic()
         history = await self.history()
         user_msg = {"role": "user", "content": user_message}
@@ -145,9 +152,11 @@ class AgentLoop:
                     on_token=lambda text: self.emit("token", {"text": text}),
                 )
             except LLMError as exc:
-                self.emit("error", {"message": str(exc), "status": exc.status})
+                # the gateway's own explanation (truncated) travels with the error: a bare
+                # "HTTP 400" told the operator nothing about which field was rejected
+                self.emit("error", {"message": exc.detail(), "status": exc.status})
                 stop_reason = "llm_error"
-                final_content = f"LLM call failed: {exc}"
+                final_content = f"LLM call failed: {exc.detail()}"
                 break
 
             usage = completion.usage or usage
@@ -155,14 +164,17 @@ class AgentLoop:
             if not calls:
                 final_content = completion.content.strip()
                 stop_reason = "stop" if final_content else "empty"
-                assistant_msg = {"role": "assistant", "content": completion.content}
+                assistant_msg = {
+                    "role": "assistant",
+                    "content": truncate_for_history(completion.content, HISTORY_MESSAGE_MAX_CHARS),
+                }
                 await self._persist("assistant", assistant_msg)
                 messages.append(assistant_msg)
                 break
 
             assistant_msg = {
                 "role": "assistant",
-                "content": completion.content or "",
+                "content": truncate_for_history(completion.content, HISTORY_MESSAGE_MAX_CHARS) or "",
                 "tool_calls": [call.to_message_part() for call in calls],
             }
             await self._persist("assistant", assistant_msg)
@@ -189,7 +201,12 @@ class AgentLoop:
                     "role": "tool",
                     "tool_call_id": call.id,
                     "name": call.name,
-                    "content": json.dumps(outcome.as_message(), ensure_ascii=False, default=str)[:120_000],
+                    # capped with a head+tail note: this row is replayed on EVERY later
+                    # turn, so an unbounded result here is a session-wide problem, not a
+                    # display problem
+                    "content": truncate_for_history(
+                        json.dumps(outcome.as_message(), ensure_ascii=False, default=str)
+                    ),
                 }
                 await self._persist("tool", tool_msg)
                 messages.append(tool_msg)

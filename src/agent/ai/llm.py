@@ -17,6 +17,7 @@ from typing import Any
 
 import httpx
 
+from agent.ai.history import GATEWAY_BODY_MAX_CHARS, sanitize_history
 from agent.config import settings
 
 log = logging.getLogger(__name__)
@@ -49,6 +50,20 @@ class LLMError(RuntimeError):
         super().__init__(message)
         self.status = status
         self.body = body
+
+    def detail(self, limit: int = GATEWAY_BODY_MAX_CHARS) -> str:
+        """The line the operator sees: our message *plus* the gateway's own words.
+
+        A bare ``LLM endpoint returned HTTP 400`` is unactionable -- the gateway explains
+        exactly which field it rejected, so that explanation is what the console shows
+        (whitespace collapsed and truncated: it is usually a JSON error object).
+        """
+        if not self.body:
+            return str(self)
+        body = " ".join(str(self.body).split())
+        if len(body) > limit:
+            body = body[: limit - 1] + "…"
+        return f"{self} — {body}"
 
 
 class ImageInputError(ValueError):
@@ -229,9 +244,14 @@ class LLMClient:
         model: str | None,
         stream: bool,
     ) -> dict[str, Any]:
+        # the single choke point every request goes through: whatever the caller assembled
+        # (a row written by an older version, a tool result that is megabytes wide, a
+        # history window that cut a tool_call/tool result pair in half) is made safe here,
+        # so one bad message can never poison a session again
+        safe_messages = sanitize_history(messages)
         payload: dict[str, Any] = {
-            "model": choose_model(model or self.model, messages),
-            "messages": messages,
+            "model": choose_model(model or self.model, safe_messages),
+            "messages": safe_messages,
             "temperature": temperature,
             "stream": stream,
         }

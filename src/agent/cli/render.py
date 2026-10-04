@@ -34,12 +34,13 @@ from __future__ import annotations
 
 import json
 import textwrap
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
-from rich.console import Console, Group
-from rich.padding import Padding
+from rich.console import Console, ConsoleOptions, Group
 from rich.panel import Panel
+from rich.segment import Segment
 from rich.syntax import Syntax
 from rich.text import Text
 
@@ -50,7 +51,8 @@ ICON_FAIL = "✖"
 
 #: prefix every answer line owns, so the transcript reads top-to-bottom: tool log, answer
 ANSWER_PREFIX = "agent ›"
-ANSWER_INDENT = " " * len(ANSWER_PREFIX)
+#: where the answer text starts: the prefix, plus the space that separates it from the text
+ANSWER_INDENT = " " * (len(ANSWER_PREFIX) + 1)
 
 #: how many characters of streamed answer text are buffered before it is printed
 ANSWER_FLUSH_CHARS = 4000
@@ -70,6 +72,32 @@ ERROR_HINTS = {
     "invalid_args": "fetch the schema with get_tool_schema before calling",
     "timeout": "raise timeout_s or memory_mb for this call",
 }
+
+#: the smallest run of identical consecutive output lines worth collapsing as noise
+#: (two identical lines are still plausible real output; three is a probing loop)
+DUP_RUN_MIN = 3
+
+
+@dataclass
+class _Indent:
+    """Indent a renderable by ``size`` columns *without* padding its lines to the width.
+
+    ``rich.padding.Padding`` renders its child with ``pad=True``, which fills every line
+    out to the terminal width so a background style can cover it.  On a real terminal that
+    is visible as output padded with trailing spaces, which survives select/copy and makes
+    the transcript look ragged, so the tool body is indented with this instead.
+    """
+
+    renderable: Any
+    size: int
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> Iterable[Segment]:
+        prefix = Segment(" " * self.size)
+        child = options.update_width(max(1, options.max_width - self.size))
+        for line in console.render_lines(self.renderable, child, pad=False):
+            yield prefix
+            yield from line
+            yield Segment.line()
 
 
 def _gutter(index: int | None, last: bool = False) -> Text:
@@ -97,35 +125,81 @@ def _fold_note(hidden: int, total: int) -> str:
     return f"… 已折叠 {_count(hidden)} 行（共 {_count(total)} 行 · /more 看全文 · /log fold off 关闭折叠）"
 
 
-def wrap_answer(text: str, width: int) -> str:
-    """Wrap ``text`` to ``width`` columns, keeping its paragraph/list structure.
+def wrap_answer(text: str, width: int, *, after_prefix: bool = True) -> str:
+    """Wrap ``text`` to ``width`` columns, keeping its paragraph/list/code structure.
 
-    Blank lines stay blank (that is what separates paragraphs and keeps a list a list) and
-    continuation lines are indented under :data:`ANSWER_PREFIX`, so a wrapped answer never
-    reads as if it were another speaker.  Pure, so the wrapping is unit-testable.
+    Blank lines stay blank (that is what separates paragraphs, keeps a list a list and
+    keeps a ``` fence a fence) and every line after the first is indented by
+    :data:`ANSWER_INDENT` so a wrapped answer keeps one straight left edge instead of
+    drifting.
+
+    ``after_prefix=True`` is the streaming case: the caller has already written the
+    ``agent ›`` gutter on the current line, so the first row starts immediately after it.
+    ``after_prefix=False`` indents every row, for the ``/more answer`` reprint where the
+    gutter has a line to itself.
+
+    A trailing newline in ``text`` is preserved, because the renderer flushes one line at
+    a time: without it every streamed line would be glued onto the previous one (which is
+    what used to turn a fenced code block into ``\\`\\`\\`Linux … \\`\\`\\``` on a single line).
     """
     limit = max(20, int(width))
+    source = str(text or "")
     rows: list[str] = []
-    for line in str(text or "").splitlines():
+    for line in source.splitlines():
         stripped = line.rstrip()
         if not stripped:
-            rows.append("")
+            rows.append("")  # stays genuinely empty: no gutter spaces on a blank line
             continue
         indent = " " * (len(stripped) - len(stripped.lstrip()))
-        rows.extend(
+        parts = (
             textwrap.wrap(
-                stripped,
-                width=limit,
-                initial_indent=indent,
-                subsequent_indent=indent + ANSWER_INDENT + "  ",
+                stripped.lstrip(),
+                width=max(20, limit - len(indent)),
                 break_long_words=True,
                 break_on_hyphens=False,
                 replace_whitespace=False,
                 drop_whitespace=True,
             )
-            or [indent]
+            or [""]
         )
-    return "\n".join(rows)
+        rows.append(indent + parts[0])
+        rows.extend(indent + part for part in parts[1:])
+
+    body: list[str] = []
+    for position, row in enumerate(rows):
+        if not row or (position == 0 and after_prefix):
+            body.append(row)
+        else:
+            body.append(ANSWER_INDENT + row)
+    wrapped = "\n".join(body)
+    if source.endswith("\n"):
+        wrapped += "\n"
+    return wrapped
+
+
+def collapse_repeats(text: str, *, minimum: int = DUP_RUN_MIN) -> str:
+    """Collapse a run of identical consecutive lines into one line plus a count.
+
+    The guest is routinely noisy in a way that buries the real output: a command that
+    probes several cgroup knobs prints the *same* ``… Permission denied`` line once per
+    knob, and one of those runs can fill the whole preview.  The count is kept so nothing
+    is silently lost, and ``/more`` still reprints the untouched text.
+    """
+    rows = str(text or "").splitlines()
+    out: list[str] = []
+    index = 0
+    while index < len(rows):
+        row = rows[index]
+        run = 1
+        while index + run < len(rows) and rows[index + run] == row:
+            run += 1
+        if run >= minimum and row.strip():
+            out.append(row)
+            out.append(f"… 上一行重复了 {run - 1} 次（共 {run} 行相同 · /more 看全文）")
+        else:
+            out.extend(rows[index : index + run])
+        index += run
+    return "\n".join(out)
 
 
 @dataclass
@@ -186,6 +260,13 @@ class StepRenderer:
     _answer_chars: int = 0
     _answer_open: bool = False
     _last_answer: str = ""
+    #: the ``agent ›`` line already carries answer text, so later chunks are continuations
+    _answer_started: bool = False
+    #: the console is not at the start of a line (so a terminator is still needed)
+    _answer_line_open: bool = False
+    #: something of this turn is already on screen, and a blank line was already emitted
+    _any_output: bool = False
+    _blank_open: bool = False
 
     # ------------------------------------------------------------------ history
     def _remember(self, record: ResultRecord) -> None:
@@ -218,6 +299,26 @@ class StepRenderer:
             self.console.file.flush()
             self._streaming = False
 
+    def _blank(self) -> None:
+        """Start a new block: exactly one blank line, never two and never a leading one.
+
+        The transcript is a sequence of blocks (the ``you ›`` line, the tool log, the
+        ``agent ›`` answer, the footer), and every pair of them is separated by exactly one
+        blank line.  Tracking it here is what stops the old behaviour of two blank lines in
+        one place and none in another.
+        """
+        if self._blank_open or not self._any_output:
+            return
+        self.console.file.write("\n")
+        self.console.file.flush()
+        self._blank_open = True
+
+    def _printed(self) -> None:
+        """Note that a block just wrote real content (so the next block gets its blank)."""
+        self._any_output = True
+        self._blank_open = False
+        self._answer_line_open = False
+
     @property
     def answer(self) -> str:
         """The text of the last finished answer (``""`` before the first one)."""
@@ -245,22 +346,32 @@ class StepRenderer:
             return
         if not self._answer_prefix_written:
             self._ensure_answer_prefix()
-        body = wrap_answer(chunk, self._answer_width())
+        # the first chunk continues the ``agent ›`` line; every later one is a continuation
+        body = wrap_answer(chunk, self._answer_width(), after_prefix=not self._answer_started)
         self.console.file.write(body)
         self.console.file.flush()
+        self._answer_started = True
+        self._answer_line_open = not body.endswith("\n")
+        self._any_output = True
 
     def _answer_width(self) -> int:
         """Wrap to the terminal, minus the room the prefix/indent takes up."""
         width = int(getattr(self.console, "width", 0) or 0)
         if width <= 0:
             width = 100
-        return max(20, width - len(ANSWER_PREFIX))
+        return max(20, width - len(ANSWER_INDENT))
 
     def _ensure_answer_prefix(self) -> None:
-        """Put ``agent ›`` on its own line, so the answer never glues itself to the log."""
+        """Put ``agent ›`` on its own gutter, never glued to the tool log above it."""
         self._end_stream()
-        self.console.print(f"[dim]{ANSWER_PREFIX}[/dim]")
+        self._blank()
+        # no newline: the first wrapped row belongs on this same line, so the continuation
+        # indent lines up under the text instead of under a prefix on its own line
+        self.console.print(f"[dim]{ANSWER_PREFIX} [/dim]", end="")
         self._answer_prefix_written = True
+        self._any_output = True
+        self._blank_open = False
+        self._answer_line_open = True
 
     def finish_answer(self, final: bool = False, text: str | None = None) -> None:
         """Close the tool block and print the answer, wrapped, separated by one blank line.
@@ -275,12 +386,17 @@ class StepRenderer:
         if not self._answer_open and not self._answer_prefix_written and not self._answer_buffer and not final:
             return
         self._flush_answer()
-        self.console.file.write("\n")
-        self.console.file.flush()
+        if self._answer_line_open:
+            # terminate the answer's last line; already-terminated output must not gain a
+            # second blank line (that was the "2 blank lines in places" defect)
+            self.console.file.write("\n")
+            self.console.file.flush()
+            self._answer_line_open = False
         if final:
             self._remember_answer()
         self._answer_open = False
         self._answer_prefix_written = False
+        self._answer_started = False
 
     def _remember_answer(self) -> None:
         """Keep the newest whole answer inside the same bound as the tool results."""
@@ -293,8 +409,9 @@ class StepRenderer:
         """Reprint the last answer in full (``/more answer``); False when there is none."""
         if not self._last_answer.strip():
             return False
-        self.console.print(f"[dim]{ANSWER_PREFIX}  （上一条回答 · 完整文本）[/dim]")
-        self.console.print(wrap_answer(self._last_answer, self._answer_width()))
+        self.console.print(f"[dim]{ANSWER_PREFIX}[/dim] [dim]（上一条回答 · 完整文本）[/dim]")
+        # the gutter has a line to itself here, so every row lines up under it
+        self.console.print(wrap_answer(self._last_answer, self._answer_width(), after_prefix=False))
         self.console.print()
         return True
 
@@ -330,6 +447,7 @@ class StepRenderer:
                     title_align="left",
                 )
             )
+            self._printed()
         elif kind == "done":
             self._done(event)
 
@@ -344,11 +462,13 @@ class StepRenderer:
             self.finish_answer()
             args = json.dumps(event.get("arguments", {}), ensure_ascii=False)
             self.console.print(f"[bold yellow]→ {event.get('tool')}[/bold yellow] [dim]{args[:400]}[/dim]")
+            self._printed()
         elif kind == "tool_result":
             self.finish_answer()
             status = "[green]ok[/green]" if event.get("ok") else "[red]failed[/red]"
             detail = event.get("preview") or event.get("error") or ""
             self.console.print(f"  [dim]{status} {event.get('duration_ms', 0)}ms[/dim] {detail[:400]}")
+            self._printed()
         elif kind == "error":
             self.finish_answer()
             self.console.print(f"[bold red]error:[/bold red] {event.get('message')}")
@@ -367,6 +487,7 @@ class StepRenderer:
         if self.show_args:
             header.append("  " + _compact_args(event.get("arguments") or {}), style="dim")
         self.console.print(header, soft_wrap=True)
+        self._printed()
 
     def _captions(self, label: str, text: str, stderr: str) -> None:
         """The labelled, gutter-owned body of a result (used by the live view and /more)."""
@@ -378,16 +499,16 @@ class StepRenderer:
         caption.append_text(_gutter(None))
         caption.append(f"  {label}", style="bold cyan")
         self.console.print(caption)
-        # indent the body so the step visually owns it, like an IDE output panel
-        self.console.print(Padding(renderable, (0, 0, 0, GUTTER_WIDTH + 2)))
+        # indent the body so the step visually owns it, like an IDE output panel.
+        # _Indent, not Padding: Padding pads every line out to the terminal width with
+        # spaces, which is visible as ragged trailing whitespace on a real terminal.
+        self.console.print(_Indent(renderable, GUTTER_WIDTH + 2))
         if stderr:
             err_caption = Text()
             err_caption.append_text(_gutter(None))
             err_caption.append("  stderr", style="bold red")
             self.console.print(err_caption)
-            self.console.print(
-                Padding(Syntax(stderr, "text", background_color="default"), (0, 0, 0, GUTTER_WIDTH + 2))
-            )
+            self.console.print(_Indent(Syntax(stderr, "text", background_color="default"), GUTTER_WIDTH + 2))
 
     def _tool_result(self, event: dict[str, Any]) -> None:
         ok = bool(event.get("ok"))
@@ -428,6 +549,7 @@ class StepRenderer:
                     duration_ms=int(duration or 0),
                 )
             )
+            self._printed()
             return
 
         label, text = _pick(payload)
@@ -443,17 +565,20 @@ class StepRenderer:
             self.console.print(line)
 
         rows = text.splitlines()
+        # the routine guest noise (one identical "… Permission denied" line per cgroup knob
+        # it tried) is collapsed for the preview only: ResultRecord keeps the raw text, so
+        # /more still reprints every line
         if self.fold and len(rows) > self.fold_preview:
             # folded: the header/meta stay, only the head of the output is printed
             shown, hidden = _clip(text, self.fold_preview)
-            self._captions(label, shown, stderr)
+            self._captions(label, collapse_repeats(shown), stderr)
             note = Text()
             note.append_text(_gutter(None))
             note.append("  " + _fold_note(hidden, len(rows)), style="yellow")
             self.console.print(note)
         else:
             clipped, extra = _clip(text, self.max_lines)
-            self._captions(label, clipped, stderr)
+            self._captions(label, collapse_repeats(clipped), stderr)
             if extra:
                 note = Text()
                 note.append_text(_gutter(None))
@@ -473,6 +598,7 @@ class StepRenderer:
                 duration_ms=int(duration or 0),
             )
         )
+        self._printed()
 
     def print_full_output(self, back: int = 1) -> bool:
         """Reprint a retained result in full; False when nothing that old is retained.
@@ -530,15 +656,23 @@ class StepRenderer:
 
     def _done(self, event: dict[str, Any]) -> None:
         self.finish_answer()
+        self._blank()  # one blank line between the answer/tool block and the footer
         self.console.print(Text(self._summary(event), style="dim"))
         if self._step_tools:
             used = ", ".join(f"{name}×{count}" for name, count in sorted(self._step_tools.items()))
             self.console.print(Text(f"tools: {used}", style="dim"))
+        self._printed()
 
     def _summary(self, event: dict[str, Any]) -> str:
         steps = event.get("steps") or []
         usage = event.get("usage") or {}
-        parts = [f"{len(steps) or self._step} tool call(s)", f"{event.get('duration_ms', 0)} ms"]
+        turns = len(steps)
+        parts = [f"{turns} tool call(s)", f"{event.get('duration_ms', 0)} ms"]
+        if self._step != turns:
+            # _step counts every call this *session* has made (this renderer survives
+            # between turns), which is why two failed turns printed the same number: without
+            # this label the count reads as "what just happened" and misleads everyone
+            parts.append(f"本会话累计 {self._step} 次")
         if usage.get("total_tokens"):
             parts.append(f"{usage['total_tokens']} tokens")
         if self._failures:
