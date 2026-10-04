@@ -22,6 +22,11 @@ from agent.registry import repository as repo
 log = logging.getLogger(__name__)
 
 PROMPT_PATH = Path(__file__).parent / "prompts" / "system.md"
+#: the operating tail: authorization from the operator's own material, honesty, and
+#: how to refuse (name the real code-level limit + how to lift it).  Deliberately
+#: appended *after* the persona in :func:`load_system_prompt`, so a persona can
+#: restyle the answer but never weaken these rules.
+OPERATING_PATH = Path(__file__).parent / "prompts" / "operating.md"
 MAX_TOOL_CALLS_PER_STEP = 8
 
 EventSink = Callable[[str, dict[str, Any]], None]
@@ -62,17 +67,20 @@ class TurnResult:
 
 
 def load_system_prompt(session_id: str, extra: str | None = None, persona: str | None = None) -> str:
-    """Base prompt + the configured persona + runtime facts.
+    """Base prompt + the configured persona + the operating tail + runtime facts.
 
-    The persona is chosen by the operator (config or console), never by the model, and
-    it is appended *after* the base contract, so it can restyle the answer but cannot
-    remove the safety rules.
+    The persona is chosen by the operator (config or console), never by the model,
+    and the operating section (``prompts/operating.md``: the operator's own
+    credentials are the authorization, never fake a result, name the real limit) is
+    appended *after* the persona, so a persona can restyle the answer but cannot
+    remove or weaken the safety and honesty rules.
     """
     base = PROMPT_PATH.read_text(encoding="utf-8")
+    operating = OPERATING_PATH.read_text(encoding="utf-8")
     facts = [f"Current session id: {session_id}.", "Your sandbox workspace persists for this session."]
     if extra:
         facts.append(extra)
-    return personas.build_system_prompt(base, personas.load(persona), facts)
+    return personas.build_system_prompt(base, personas.load(persona), facts, operating=operating)
 
 
 def _preview(value: Any, limit: int = 400) -> str:

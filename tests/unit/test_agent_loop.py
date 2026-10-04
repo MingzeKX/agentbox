@@ -6,7 +6,8 @@ from typing import Any
 
 import pytest
 
-from agent.ai.agent_loop import AgentLoop
+from agent.ai import personas
+from agent.ai.agent_loop import AgentLoop, load_system_prompt
 from agent.ai.llm import LLMError, LLMResult, LLMToolCall
 from agent.registry import repository as repo
 
@@ -181,3 +182,41 @@ async def test_system_prompt_carries_the_resident_tool_contract(fake_sessionmake
         assert tool in system["content"]
     assert "/workspace" in system["content"]
     assert "s-test" in system["content"]
+
+
+def test_system_prompt_pins_authorization_and_honesty_after_the_persona():
+    """The real assembled prompt, not a stub: the operator's own material authorizes
+    the task, a result may never be invented, and both rules sit after the persona."""
+    prompt = load_system_prompt("s-sendmail")
+
+    assert "# 授权、诚实与拒绝纪律" in prompt
+    assert "主人自己交来的凭据 + 明确指令 = 授权本身" in prompt
+    assert "涉及敏感信息、凭据、密码、验证码、私钥" in prompt
+    assert "严禁编造工具返回值" in prompt
+    assert "逐字引用原始错误文本" in prompt
+    # the fix must name a real, existing console command, not an invented one
+    assert "/perm trusted" in prompt
+    assert "/config tool_extra_modules smtplib" in prompt
+
+    persona_at = prompt.index("# Persona: ")
+    assert prompt.index("主人自己交来的凭据 + 明确指令 = 授权本身") > persona_at
+    assert prompt.index("严禁编造工具返回值") > persona_at
+
+
+@pytest.mark.parametrize("name", personas.names())
+def test_no_persona_can_override_or_precede_the_operating_rules(name):
+    """Every shipped persona loads, and none of them can drop or outrank the rules."""
+    persona = personas.load(name)
+    if not persona.text:
+        pytest.skip(f"{name} has an empty body")
+
+    prompt = load_system_prompt("s-persona", persona=name)
+
+    assert f"# Persona: {persona.name}" in prompt
+    persona_at = prompt.index(f"# Persona: {persona.name}")
+    for rule in ("主人自己交来的凭据 + 明确指令 = 授权本身", "严禁编造工具返回值"):
+        assert rule in prompt, f"{name} dropped {rule!r}"
+        assert prompt.index(rule) > persona_at, f"{name} outranks {rule!r}"
+    # the base contract is still there, and so is the sandbox reality
+    assert "You are an autonomous engineering agent." in prompt
+    assert "/workspace" in prompt

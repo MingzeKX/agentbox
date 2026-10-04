@@ -17,6 +17,14 @@ from agent.config import settings
 
 BASE = "# Role\n\nYou are an autonomous engineering agent.\n\n# Resident tools\n\ncall_tool(name, arguments)\n"
 
+#: the two rules the operating tail must always carry, verbatim: the operator's own
+#: credentials are the authorization (no refusal, no lecturing), and a result may
+#: never be invented.  Pinned literally on purpose -- rewording the prompt has to
+#: re-read these tests.
+AUTHORIZATION_RULE = "主人自己交来的凭据 + 明确指令 = 授权本身"
+NO_FABRICATION_RULE = "严禁编造工具返回值"
+OPERATING_MARK = "# 授权、诚实与拒绝纪律"
+
 
 def test_all_bundled_personas_load():
     found = personas.available()
@@ -48,6 +56,34 @@ def test_persona_is_appended_after_the_base_contract():
     assert prompt.index("# Persona") > prompt.index("# Resident tools")
     assert "# Runtime" in prompt
     assert prompt.index("# Runtime") > prompt.index("# Persona")
+
+
+def test_the_operating_tail_goes_after_every_persona():
+    """The authorization/honesty rules are the last word: no persona can precede them.
+
+    This is the ordering the operator relies on -- a persona may restyle the answer,
+    never the rules that bind it.
+    """
+    tail = f"{OPERATING_MARK}\n\n{AUTHORIZATION_RULE}\n\n{NO_FABRICATION_RULE}\n"
+    for name in personas.available():
+        persona = personas.load(name)
+        prompt = personas.build_system_prompt(BASE, persona, ["fact"], operating=tail)
+        assert f"# Persona: {name}" in prompt
+        assert AUTHORIZATION_RULE in prompt
+        assert NO_FABRICATION_RULE in prompt
+        assert prompt.index(OPERATING_MARK) > prompt.index(f"# Persona: {name}"), (
+            f"persona {name} must not be able to talk past the operating rules"
+        )
+        # the base contract still survives, tail and all
+        assert "You are an autonomous engineering agent." in prompt
+        assert "call_tool(name, arguments)" in prompt
+
+
+def test_an_empty_operating_tail_adds_nothing():
+    persona = personas.load("concise")
+    assert personas.build_system_prompt(BASE, persona, [], operating="   \n ") == personas.build_system_prompt(
+        BASE, persona, []
+    )
 
 
 @pytest.mark.parametrize(

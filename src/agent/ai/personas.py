@@ -2,9 +2,9 @@
 
 A persona is a markdown file injected into the system prompt as a *style* section.
 It cannot change what the agent is allowed to do -- every permission lives in code
-(tool tiers, the network firewall, the sandbox), never in the prompt.  The safety
-sections of the base prompt are appended *after* the persona, so a persona cannot
-talk the agent out of them.
+(tool tiers, the network firewall, the sandbox), never in the prompt.  The operating
+tail (authorization, honesty, naming a real limit) is appended *after* the persona,
+so a persona cannot talk the agent out of it.
 
 Resolution order for a name (sanitised, no separators): the operator directory
 (``AGENT_PERSONA_DIR``, default ``<repo>/personas``) first -- so a deployment can
@@ -88,15 +88,19 @@ def load(name: str | None = None) -> Persona:
     return Persona(name=DEFAULT_PERSONA, text=text, source="default")
 
 
-def build_system_prompt(base: str, persona: Persona, facts: list[str]) -> str:
-    """Assemble base prompt + persona + runtime facts.
+def build_system_prompt(base: str, persona: Persona, facts: list[str], operating: str = "") -> str:
+    """Assemble base prompt + persona + the operating/safety tail + runtime facts.
 
-    Order matters: the persona goes after the base prompt's contract but before the
-    runtime section, and the base prompt's safety text is never removed.
+    Order matters: the persona goes after the base prompt's contract, and the
+    operating tail (authorization, honesty, how to name a real limit) goes *after*
+    the persona, so no persona can restyle it away.  Nothing in the base prompt is
+    ever removed.
     """
     parts = [base.rstrip()]
     if persona.text:
         parts.append(f"# Persona: {persona.name}\n\n{persona.text}")
+    if operating.strip():
+        parts.append(operating.strip())
     if facts:
         parts.append("# Runtime\n\n" + "\n".join(f"* {line}" for line in facts))
     return "\n\n".join(parts) + "\n"
