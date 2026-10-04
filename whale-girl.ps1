@@ -165,6 +165,22 @@ if ($aiUp -and $cpUp) {
 $env:AGENT_PERSONA = $Persona
 if (-not $env:PYTHONIOENCODING) { $env:PYTHONIOENCODING = 'utf-8' }
 
+# 人格由 AI 服务端决定（本进程里的 AGENT_PERSONA 不生效）：通过 /admin/config 设置
+$body = '{"set":{"persona":"' + $Persona + '"}}'
+try {
+    $secretLine = Select-String -Path (Join-Path $PSScriptRoot '.env') -Pattern '^AGENT_CONTROL_SECRET=' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($secretLine) {
+        $secret = ($secretLine.Line -replace '^AGENT_CONTROL_SECRET=', '').Trim()
+        Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8090/admin/config' `
+            -Headers @{ 'X-Agent-Token' = $secret } -ContentType 'application/json' -Body $body -TimeoutSec 20 | Out-Null
+        Write-Host "  已设置人格：$Persona（服务端，已持久化到 VM 的 .env）" -ForegroundColor Green
+    } else {
+        Write-Host "  .env 里没有 AGENT_CONTROL_SECRET，进去后用 /persona $Persona 切换" -ForegroundColor Yellow
+    }
+} catch {
+    Write-Host "  人格设置失败（进去后用 /persona $Persona 切换）：$_" -ForegroundColor Yellow
+}
+
 $chatArgs = @('-m', 'agent.cli', 'chat')
 if ($Voice -and -not $Message) { $chatArgs += '--voice' }
 if ($NoSpeak) { $chatArgs += '--no-speak' }
