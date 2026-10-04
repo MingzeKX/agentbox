@@ -14,11 +14,11 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
-from sqlalchemy import Column, cast, delete, insert, select, update
+from sqlalchemy import Column, cast, delete, select, update
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.sql import operators
 from sqlalchemy.sql.dml import Delete, Insert, Update
 from sqlalchemy.sql.elements import BinaryExpression, BindParameter, BooleanClauseList
-from sqlalchemy.sql import operators
 
 from agent.ai import app as app_module
 from agent.config import settings
@@ -88,20 +88,32 @@ class FakeResult:
 
 
 class _Predicate:
-    """Evaluates the *real* WHERE clause of a statement against one model object.
+    """Evaluates the *real* WHERE clause of a statement against the row it selects.
 
     It walks the SQLAlchemy expression tree instead of the rendered SQL, so a wrong
     column, the wrong operator or a forgotten ``status`` filter in ``repository.py``
     still makes the test fail -- which is the point of testing against a fake session.
+
+    ``rows`` is keyed by table name because ``recent_runs`` selects ``tool_runs`` joined
+    to ``tools``: an INNER JOIN whose ``tools`` half is missing (the tool was deleted, so
+    its runs keep a NULL ``tool_id``) contributes no row -- exactly like PostgreSQL, and
+    exactly what keeps an orphaned run out of the per-tool history.
     """
 
-    def __init__(self, row: Any, params: dict[str, Any]) -> None:
-        self.row = row
+    def __init__(self, rows: dict[str, Any], params: dict[str, Any]) -> None:
+        self.rows = rows
         self.params = params
 
     def resolve(self, node: Any) -> Any:
         if isinstance(node, Column):
-            return getattr(self.row, node.key)
+            table = node.table.name
+            if table not in self.rows:
+                raise AssertionError(
+                    f"the statement filters on {table}.{node.key}, which this query does not select"
+                )
+            row = self.rows[table]
+            # a missing INNER JOIN partner makes every predicate on that table false
+            return None if row is None else getattr(row, node.key)
         if isinstance(node, BindParameter):
             return node.value
         if isinstance(node, BooleanClauseList):
@@ -130,11 +142,12 @@ class _Predicate:
         return True
 
 
-def _matches(stmt: Any, row: Any) -> bool:
+def _matches(stmt: Any, **rows: Any) -> bool:
+    """``rows`` is keyed by table name: ``_matches(stmt, tools=row)``."""
     where = getattr(stmt, "whereclause", None)
     if where is None:
         return True
-    return _Predicate(row, stmt.compile().params).matches(where)
+    return _Predicate(rows, stmt.compile().params).matches(where)
 
 
 class FakeRegistrySession:
@@ -186,7 +199,7 @@ class FakeRegistrySession:
     def _update(self, stmt: Any) -> FakeResult:
         assignments = {_key(key): _value(value) for key, value in stmt._values.items()}  # noqa: SLF001
         if _target_class(stmt) is ToolRun:
-            matched = [row for row in self.ledger if _matches(stmt, row)]
+            matched = [row for row in self.ledger if _matches(stmt, tool_runs=row)]
             for row in matched:
                 self.ledger_unlinks.append(
                     {
@@ -198,7 +211,7 @@ class FakeRegistrySession:
                 )
                 row.tool_id = None
             return FakeResult(rowcount=len(matched))
-        rows = [row for row in self.tools if _matches(stmt, row)]
+        rows = [row for row in self.tools if _matches(stmt, tools=row)]
         for row in rows:
             for key, value in assignments.items():
                 if key == "updated_at":
@@ -210,14 +223,14 @@ class FakeRegistrySession:
     def _delete(self, stmt: Any) -> FakeResult:
         targets = _target_class(stmt)
         if targets is Tool:
-            removed = [row for row in self.tools if _matches(stmt, row)]
+            removed = [row for row in self.tools if _matches(stmt, tools=row)]
             self.tools = [row for row in self.tools if row not in removed]
             # the fake models the *fresh* schema (ON DELETE SET NULL): the run rows
             # survive, and only an FK that still says CASCADE would drop them -- which
             # is exactly why the repository nulls tool_id itself first.
             return FakeResult(rowcount=len(removed))
         if targets is ToolRun:
-            removed_runs = [row for row in self.ledger if _matches(stmt, row)]
+            removed_runs = [row for row in self.ledger if _matches(stmt, tool_runs=row)]
             self.ledger = [row for row in self.ledger if row not in removed_runs]
             return FakeResult(rowcount=len(removed_runs))
         if targets is ToolTombstone:
@@ -229,8 +242,12 @@ class FakeRegistrySession:
         # only real columns: limit/offset/order_by elements are not columns at all
         columns = [getattr(column, "key", None) for column in stmt.exported_columns]
         keys = [key for key in columns if key in Tool.__table__.c]
-        rows = [row for row in self.tools if _matches(stmt, row)] if targets is Tool else []
-        runs = [row for row in self.ledger if _matches(stmt, row)] if targets is ToolRun else []
+        rows = [row for row in self.tools if _matches(stmt, tools=row)] if targets is Tool else []
+        runs = (
+            [row for row in self.ledger if _matches(stmt, tool_runs=row, tools=self._joined_tool(row))]
+            if targets is ToolRun
+            else []
+        )
         if targets is Tool and keys == ["version", "status"]:
             rows.sort(key=lambda row: -row.version)
             return FakeResult([(row.version, row.status) for row in rows])
@@ -242,6 +259,12 @@ class FakeRegistrySession:
         if targets is ToolRun:
             return FakeResult(runs)
         return FakeResult()
+
+    def _joined_tool(self, run: Any) -> Any:
+        """The ``tools`` row an INNER JOIN pairs with this run (``None`` for an orphan)."""
+        if not isinstance(run, ToolRun) or run.tool_id is None:
+            return None
+        return next((tool for tool in self.tools if tool.id == run.tool_id), None)
 
     async def run_sync(self, fn: Any) -> None:
         # the tombstone table "already exists" in the fake database
@@ -268,6 +291,12 @@ class FakeRegistrySession:
 
 
 def _target_class(stmt: Any) -> Any:
+    # ``select(ToolRun).join(Tool, ...)`` knows its entity; its FROM element is a join
+    # object with no table name, so ask the statement what it actually selects first.
+    descriptions = getattr(stmt, "column_descriptions", None) or []
+    entity = descriptions[0].get("entity") if descriptions else None
+    if entity in (Tool, ToolRun, ToolTombstone):
+        return entity
     table = getattr(stmt, "table", None)
     if table is None:
         froms = getattr(stmt, "get_final_froms", lambda: [])()
@@ -287,11 +316,25 @@ def _value(value: Any) -> Any:
     return value.value if isinstance(value, BindParameter) else value
 
 
+def _children(node: Any) -> list[Any]:
+    getter = getattr(node, "get_children", None)
+    return list(getter()) if callable(getter) else []
+
+
 def _sentinel(expression: Any) -> Any:
-    """The dict a ``args_redacted || cast({...} AS JSONB)`` expression writes."""
-    for element in getattr(expression, "right", None), *getattr(expression, "get_children", lambda: [])():
-        if isinstance(element, BindParameter) and isinstance(element.value, dict):
-            return element.value
+    """The dict a ``args_redacted || cast({...} AS JSONB)`` expression writes.
+
+    The repository wraps the literal in ``cast(..., JSONB)``, so the dict is *not*
+    ``expression.right`` itself -- it is a node underneath it.  Walk the tree instead of
+    assuming a shape, so re-parenting the expression fails here only if the value the
+    database would really store changed.
+    """
+    stack = [expression]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, BindParameter) and isinstance(node.value, dict):
+            return node.value
+        stack.extend(_children(node))
     return None
 
 
@@ -386,7 +429,9 @@ async def test_hard_delete_removes_the_row_and_keeps_the_run_ledger():
     assert len(session.ledger_unlinks) == 1
     assert session.ledger_unlinks[0]["sentinel"] == {"tool_ref": "upper_text"}
     assert "||" in session.ledger_unlinks[0]["expression"], "JSONB concatenation, not an overwrite"
-    assert await repo.recent_runs(session, "upper_text") == [], "an orphaned run is no longer listed per tool"
+    # v2 still exists, so its runs stay visible per-tool; only the deleted version's
+    # orphaned run drops out (recent_runs INNER JOINs tools on tool_id)
+    assert sorted(row.id for row in await repo.recent_runs(session, "upper_text")) == [2, 3]
     assert session.run_sync_calls == 1, "the tombstone table is ensured before it is written to"
 
 
@@ -460,7 +505,8 @@ def test_ledger_sentinel_uses_jsonb_concat():
     """``args_redacted || {"tool_ref": name}`` must stay a JSONB concatenation."""
     expression = ToolRun.args_redacted + cast({"tool_ref": "upper_text"}, JSONB)
     assert "||" in str(expression)
-    assert "tool_ref" in json.dumps(expression.right.value)
+    assert str(expression.type) == "JSONB", "the concatenation stays JSONB, not text"
+    assert _sentinel(expression) == {"tool_ref": "upper_text"}, "the ref travels inside the cast"
 
 
 # --------------------------------------------------------------------------- #
@@ -678,9 +724,14 @@ async def test_admin_inventory_lists_every_row_with_the_operator_fields(monkeypa
     session.seed(make_tool(name="upper_text", version=2), with_runs=False)
     monkeypatch.setattr(app_module.registry_db, "get_sessionmaker", lambda: FakeSessionmaker(session))
     monkeypatch.setattr(settings, "control_secret", "test-token")
-    _, endpoint = admin_endpoint("/admin/tools")
+    app, endpoint = admin_endpoint("/admin/tools")
+    route = next(route for route in app.routes if getattr(route, "path", None) == "/admin/tools")
+    assert {field.name for field in route.dependant.query_params} == {"limit", "offset"}, (
+        "the console paginates the inventory over HTTP; FastAPI resolves these defaults, so "
+        "the direct call below has to pass them itself"
+    )
 
-    payload = _decode(await endpoint(FakeRequest(token="test-token")))
+    payload = _decode(await endpoint(FakeRequest(token="test-token"), limit=200, offset=0))
 
     assert payload["ok"] is True and payload["count"] == 2
     rows = {row["name"]: row for row in payload["tools"]}
