@@ -5,6 +5,9 @@ Everything that changes the *service* goes through the AI service's
 Commands that only affect this terminal (``/log``, ``/more``, ``/clear``, ``/session``,
 ``/new``) are handled locally.  ``/voice`` uploads a local recording to the AI
 service's ``/asr`` endpoint and feeds the transcript back in as the next message.
+``/stop`` is the other kind of local command: it runs the host-side teardown script
+(``deploy/windows/stop-agent.ps1``) and then leaves the chat -- deliberately never
+touching ``/admin/config``, because the AI service it is about to stop may already be down.
 
 Persistence is automatic: every successful change is written to the VM's ``.env`` right
 away (the same ssh rewrite ``/save`` performs), so a runtime change survives a restart
@@ -64,6 +67,7 @@ COMMANDS: tuple[str, ...] = (
     "cls",
     "session",
     "new",
+    "stop",
     "exit",
     "quit",
 )
@@ -80,6 +84,7 @@ SUBCOMMANDS: dict[str, tuple[str, ...]] = {
     "speak": ("on", "off"),
     "image": (),  # paths are typed, not completed
     "tools": ("list", "retire", "delete"),
+    "stop": ("now",),
 }
 
 #: tiers the registry groups tools by, in the order /tools prints them
@@ -125,6 +130,21 @@ ASR_MEDIA_TYPES: dict[str, str] = {
     ".webm": "audio/webm",
     ".flac": "audio/ogg",
 }
+
+#: the host-side teardown ``/stop`` runs, relative to the repository root
+STOP_SCRIPT = Path("deploy") / "windows" / "stop-agent.ps1"
+
+#: what ``/stop`` asks before it tears the stack down (``/stop now`` skips this)
+STOP_CONFIRM_PROMPT = "输入 y 确认关闭 agentbox（AI 服务 + 平台 VM + 沙箱 VM + 控制平面）；其它任意键取消："
+
+#: printed whenever the teardown did not happen, so the operator is never stuck
+STOP_MANUAL_HINT = "手动关闭：powershell -ExecutionPolicy Bypass -File .\\deploy\\windows\\stop-agent.ps1"
+
+
+def stop_command(script: Path) -> list[str]:
+    """The teardown command line, exactly as documented (Windows PowerShell 5.1 only)."""
+    return ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)]
+
 
 COMMAND_HELP: dict[str, str] = {
     "net": """[cyan]/net[/cyan] [dim]status[/dim]                       查看开关、白名单、端口
@@ -268,7 +288,18 @@ AGENT_VOICE_TTS；这两项不会写进 VM 的 .env（服务端没有喇叭，�
     "save": "参见 [cyan]/help config[/cyan]。",
     "session": "[cyan]/session[/cyan]                       打印当前会话 id",
     "new": "[cyan]/new[/cyan]                           开启一个新会话（下一条消息才会真正创建）",
-    "exit": "[cyan]/exit[/cyan] 或 [cyan]/quit[/cyan]                 离开控制台",
+    "stop": """[cyan]/stop[/cyan]                          关闭整个 agentbox（先确认）
+[cyan]/stop now[/cyan]                      不再确认，立即关闭
+
+会依次停掉：控制平面 → AI 服务 → 平台 VM（干净关机）→ 沙箱 VM。
+实际执行的命令（输出实时打印到这里，成功后本控制台自行退出，退出码 0）：
+  powershell -NoProfile -ExecutionPolicy Bypass -File <repo>\\deploy\\windows\\stop-agent.ps1
+只想离开聊天而不关服务，请用 [cyan]/exit[/cyan]。
+
+[bold]宿主机动作：[/bold]不经过 AI 服务的 /admin/config，所以 AI 服务已经挂了也能用。
+脚本不存在或执行失败时[bold]不会[/bold]退出控制台，会打印试过的完整路径、退出码，
+以及可以自己敲的手动命令。""",
+    "exit": "[cyan]/exit[/cyan] 或 [cyan]/quit[/cyan]                 离开控制台（不关闭服务；关闭整个 agentbox 用 [cyan]/stop[/cyan]）",
     "help": "[cyan]/help[/cyan] 或 [cyan]/help <command>[/cyan]        本说明，或某一条命令的帮助",
 }
 
@@ -291,6 +322,7 @@ HELP = """
 [cyan]/save[/cyan]      手动把当前值再同步到 VM 的 .env（改设置时已自动写入）
 [cyan]/sandbox[/cyan]   沙箱池状态
 [cyan]/clear[/cyan]     清屏（同义：[cyan]/cls[/cyan]，不改变会话）
+[cyan]/stop[/cyan]      关闭整个 agentbox：AI 服务 + 平台 VM + 沙箱 VM + 控制平面  [dim](/help stop)[/dim]
 [cyan]/session[/cyan] [cyan]/new[/cyan] [cyan]/exit[/cyan]
 
 不以斜杠开头的行会作为消息发给 agent。
@@ -506,6 +538,7 @@ class SlashConsole:
             "cls": self._cmd_clear,
             "session": self._cmd_session,
             "new": self._cmd_new,
+            "stop": self._cmd_stop,
             "exit": self._cmd_exit,
             "quit": self._cmd_exit,
         }
@@ -1273,6 +1306,72 @@ class SlashConsole:
         self.console.print("[dim]下一条消息会开始一个新会话[/dim]")
 
     def _cmd_exit(self, args: list[str]) -> None:  # noqa: ARG002
+        self.state.exit_requested = True
+
+    # ----------------------------------------------------------------------- stop
+    def _stop_script(self) -> Path:
+        """Where the host-side teardown lives: ``<repo>/deploy/windows/stop-agent.ps1``."""
+        return project_root() / STOP_SCRIPT
+
+    def _stop_failed(self, script: Path, code: int | None) -> None:
+        """Say what was tried and how to do it by hand -- and leave the console running."""
+        self.err.print(f"[red]关闭未完成[/red] 脚本：{script}")
+        self.err.print(f"[red]退出码：{'（未运行）' if code is None else code}[/red]")
+        self.err.print(f"[yellow]{STOP_MANUAL_HINT}[/yellow]")
+        self.err.print("[dim]控制台继续运行：可以重试，或手动执行上面这条命令。[/dim]")
+
+    def _run_stop_script(self, script: Path) -> int | None:
+        """Run the teardown script, streaming its output; ``None`` if it cannot start.
+
+        ``stderr`` is merged into ``stdout`` so the operator reads the shutdown in the
+        order it happened.  Windows PowerShell 5.1 writes UTF-8 when its output is
+        redirected (measured on this host); ``errors="replace"`` keeps an unexpected code
+        page from raising halfway through a shutdown.
+        """
+        argv = stop_command(script)
+        self.console.print(Text("运行：" + " ".join(argv), style="dim"))
+        try:
+            process = subprocess.Popen(  # noqa: S603 - fixed binary, explicit argv
+                argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.err.print(f"[red]无法启动关闭脚本：{exc}[/red]")
+            return None
+        with process:
+            stream = process.stdout
+            if stream is not None:
+                for raw in stream:
+                    self.console.print(Text(raw.decode("utf-8", "replace").rstrip("\r\n")))
+        code = process.returncode
+        return None if code is None else int(code)
+
+    def _cmd_stop(self, args: list[str]) -> None:
+        """Shut the whole stack down, then leave the chat -- a host-side action.
+
+        Deliberately local: it never calls ``/admin/config`` (the AI service it is about
+        to stop may already be down), and it only sets ``exit_requested`` once the
+        teardown really succeeded, so a failure leaves the operator in control.
+        """
+        if [item.lower() for item in args] not in ([], ["now"]):
+            raise RuntimeError("用法：/stop（先确认）或 /stop now（直接关闭）")
+        script = self._stop_script()
+        if not script.is_file():
+            self._stop_failed(script, None)
+            return
+        self.console.print("[bold red]即将关闭 agentbox[/bold red]：AI 服务 + 平台 VM + 沙箱 VM + 控制平面")
+        if args:
+            self.console.print("[dim]/stop now：跳过确认[/dim]")
+        else:
+            answer = self.console.input(f"[bold red]{STOP_CONFIRM_PROMPT}[/bold red]")
+            if str(answer).strip().lower() != "y":
+                self.console.print("[yellow]已取消[/yellow]：没有关闭任何东西，控制台继续运行")
+                return
+        code = self._run_stop_script(script)
+        if code != 0:
+            self._stop_failed(script, code)
+            return
+        self.console.print("[green]agentbox 已关闭[/green]：AI 服务、平台 VM、沙箱 VM、控制平面都已停止")
+        self.console.print("[dim]控制台退出（退出码 0）。[/dim]")
         self.state.exit_requested = True
 
     # -------------------------------------------------------------------- helpers

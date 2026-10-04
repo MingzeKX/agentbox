@@ -25,7 +25,7 @@ def test_bare_slash_lists_every_command():
         ("/pe", {"/perm", "/persona"}),
         ("/per", {"/perm", "/persona"}),
         ("/n", {"/net", "/new"}),
-        ("/s", {"/save", "/sandbox", "/session", "/speak"}),
+        ("/s", {"/save", "/sandbox", "/session", "/speak", "/stop"}),
     ],
 )
 def test_prefix_completion(text, expected):
