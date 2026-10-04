@@ -1,0 +1,32 @@
+[Unit]
+Description=agentbox control plane (owns QEMU sandbox VMs)
+Documentation=file:/opt/agentbox/app/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# One QEMU process per session, per-VM cgroup limits: this unit needs root for
+# cgroup v2 access.  Harden it as much as possible while keeping that.
+User=root
+WorkingDirectory=/opt/agentbox/app
+EnvironmentFile=-/opt/agentbox/app/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/agentbox/app/.venv/bin/python -m agent.cli serve control
+Restart=on-failure
+RestartSec=3
+KillMode=control-group
+TimeoutStopSec=60
+
+NoNewPrivileges=false
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=false
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictRealtime=true
+LockPersonality=true
+ReadWritePaths=/sys/fs/cgroup /var/lib/agentbox /opt/agentbox/app/var
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,26 @@
+# agentbox
+.venv/
+.pylibs/
+.tmp/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# runtime state: sandbox images, session overlays, console logs
+var/
+!var/.gitkeep
+
+# pytest scratch (should not appear once var/pytest-tmp is used)
+pytest-of-*/
+
+# local configuration (contains secrets)
+.env
+
+# QEMU for Windows and the Debian installer ISO are kept in the workspace but
+# are not part of this project's source.
+qemu/
+*.iso
+
+# repository-root scratch (TEMP resolves into the workspace on this machine)
+/tmp*/

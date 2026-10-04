@@ -1,0 +1,183 @@
+"""The agent loop: resident tools only, results fed back, budgets enforced."""
+
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+
+from agent.ai.agent_loop import AgentLoop
+from agent.ai.llm import LLMError, LLMResult, LLMToolCall
+from agent.registry import repository as repo
+
+
+class ScriptedLLM:
+    model = "scripted-model"
+
+    def __init__(self, results: list[LLMResult | Exception]) -> None:
+        self.results = list(results)
+        self.requests: list[list[dict[str, Any]]] = []
+
+    async def chat(self, messages, *, tools=None, temperature=None, model=None, on_token=None):
+        self.requests.append([dict(message) for message in messages])
+        assert tools, "the loop must always expose the resident meta tools"
+        result = self.results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        if on_token and result.content:
+            on_token(result.content)
+        return result
+
+
+class StubMeta:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
+    specs = [{"type": "function", "function": {"name": "search_tools", "parameters": {}}}]
+
+    async def call(self, name: str, args: dict, version=None, timeout_s=None):
+        from agent.ai.metacalls import DispatchOutcome
+
+        self.calls.append((name, args))
+        if name == "boom":
+            return DispatchOutcome(False, tool="boom", error="sandbox exploded", error_code="sandbox_error")
+        return DispatchOutcome(True, tool=name, result={"echo": args}, duration_ms=7)
+
+
+@pytest.fixture(autouse=True)
+def no_database(monkeypatch):
+    async def load_messages(session, session_id, limit=40):
+        return []
+
+    async def ensure_session(session, session_id, title=""):
+        return None
+
+    async def append_message(session, session_id, role, content, tokens=0):
+        return None
+
+    monkeypatch.setattr(repo, "load_messages", load_messages)
+    monkeypatch.setattr(repo, "ensure_session", ensure_session)
+    monkeypatch.setattr(repo, "append_message", append_message)
+
+
+def build_loop(llm, meta, events, fake_sessionmaker, max_steps: int = 4) -> AgentLoop:
+    return AgentLoop(
+        session_id="s-test",
+        llm=llm,  # type: ignore[arg-type]
+        meta=meta,  # type: ignore[arg-type]
+        sessionmaker=fake_sessionmaker,  # type: ignore[arg-type]
+        on_event=lambda kind, payload: events.append((kind, payload)),
+        max_steps=max_steps,
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_answer_without_tool_calls(fake_sessionmaker):
+    events: list[tuple[str, dict]] = []
+    llm = ScriptedLLM([LLMResult(content="all done", finish_reason="stop")])
+    loop = build_loop(llm, StubMeta(), events, fake_sessionmaker)
+
+    result = await loop.run("hello")
+
+    assert result.content == "all done"
+    assert result.stop_reason == "stop"
+    assert result.steps == []
+    kinds = [kind for kind, _ in events]
+    assert kinds[0] == "start"
+    assert "token" in kinds
+    assert kinds[-1] == "done"
+
+
+@pytest.mark.asyncio
+async def test_tool_call_round_trip_feeds_the_result_back(fake_sessionmaker):
+    events: list[tuple[str, dict]] = []
+    call = LLMToolCall(id="call_1", name="search_tools", arguments={"query": "read a file"}, raw_arguments="{}")
+    llm = ScriptedLLM(
+        [
+            LLMResult(content="", tool_calls=[call], finish_reason="tool_calls"),
+            LLMResult(content="I found fs.read", finish_reason="stop"),
+        ]
+    )
+    meta = StubMeta()
+    loop = build_loop(llm, meta, events, fake_sessionmaker)
+
+    result = await loop.run("read a file please")
+
+    assert meta.calls == [("search_tools", {"query": "read a file"})]
+    assert result.content == "I found fs.read"
+    assert len(result.steps) == 1
+    step = result.steps[0]
+    assert step.tool == "search_tools"
+    assert step.ok is True
+    assert step.duration_ms == 7
+
+    # the second LLM request must contain the assistant tool_call and the tool result
+    second = llm.requests[1]
+    roles = [message["role"] for message in second]
+    assert roles[-2:] == ["assistant", "tool"]
+    assert second[-2]["tool_calls"][0]["function"]["name"] == "search_tools"
+    assert '"echo"' in second[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_failed_tool_call_is_reported_to_the_model(fake_sessionmaker):
+    events: list[tuple[str, dict]] = []
+    call = LLMToolCall(id="c1", name="boom", arguments={}, raw_arguments="{}")
+    llm = ScriptedLLM(
+        [
+            LLMResult(tool_calls=[call], finish_reason="tool_calls"),
+            LLMResult(content="recovered", finish_reason="stop"),
+        ]
+    )
+    loop = build_loop(llm, StubMeta(), events, fake_sessionmaker)
+
+    result = await loop.run("trigger a failure")
+
+    assert result.steps[0].ok is False
+    tool_message = llm.requests[1][-1]
+    assert '"ok":false' in tool_message["content"].replace(" ", "")
+    assert "sandbox exploded" in tool_message["content"]
+    assert result.content == "recovered"
+
+
+@pytest.mark.asyncio
+async def test_step_budget_is_enforced(fake_sessionmaker):
+    events: list[tuple[str, dict]] = []
+    call = LLMToolCall(id="c", name="search_tools", arguments={}, raw_arguments="{}")
+    llm = ScriptedLLM([LLMResult(tool_calls=[call], finish_reason="tool_calls") for _ in range(10)])
+    loop = build_loop(llm, StubMeta(), events, fake_sessionmaker, max_steps=3)
+
+    result = await loop.run("loop forever")
+
+    assert result.stop_reason == "max_steps"
+    assert "stopped after 3 steps" in result.content
+    assert len(result.steps) == 3
+
+
+@pytest.mark.asyncio
+async def test_llm_failure_is_reported_not_raised(fake_sessionmaker):
+    events: list[tuple[str, dict]] = []
+    llm = ScriptedLLM([LLMError("endpoint down", 503, "busy")])
+    loop = build_loop(llm, StubMeta(), events, fake_sessionmaker)
+
+    result = await loop.run("hi")
+
+    assert result.stop_reason == "llm_error"
+    assert "endpoint down" in result.content
+    assert any(kind == "error" for kind, _ in events)
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_carries_the_resident_tool_contract(fake_sessionmaker):
+    events: list[tuple[str, dict]] = []
+    llm = ScriptedLLM([LLMResult(content="ok")])
+    loop = build_loop(llm, StubMeta(), events, fake_sessionmaker)
+
+    await loop.run("anything")
+
+    system = llm.requests[0][0]
+    assert system["role"] == "system"
+    for tool in ("search_tools", "get_tool_schema", "call_tool"):
+        assert tool in system["content"]
+    assert "/workspace" in system["content"]
+    assert "s-test" in system["content"]

@@ -1,0 +1,43 @@
+[Unit]
+Description=agentbox AI service (FastAPI: LLM, meta tools, tool registry access)
+Documentation=file:/opt/agentbox/app/README.md
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=agent
+Group=agent
+WorkingDirectory=/opt/agentbox/app
+EnvironmentFile=-/opt/agentbox/app/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/agentbox/app/.venv/bin/python -m agent.cli serve ai
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+
+# The AI service must never be able to touch host files or spawn processes.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/opt/agentbox/app/var
+
+[Install]
+WantedBy=multi-user.target
