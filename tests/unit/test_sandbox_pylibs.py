@@ -142,6 +142,42 @@ def test_the_build_script_installs_the_curated_set_and_verifies_it():
     assert "python3-pip" in source and "python3-venv" in source
 
 
+def test_the_build_script_recreates_the_runtime_resolver_symlink():
+    """Regression: the pip step needs a real /etc/resolv.conf and used to leave it there.
+
+    The guest root is read-only, so a regular file there means net mode can never write DNS
+    again. The build has to put the symlink back AND check it in the finished image.
+    """
+    source = BUILD_SCRIPT.read_text(encoding="utf-8")
+    assert "ln -s /run/agent/resolv.conf" in source
+    assert "debugfs" in source and "Type: symlink" in source, "the finished image is verified too"
+
+
+def test_the_guest_runner_and_the_checker_agree_on_the_curated_roots():
+    """The image installs packages; the checker has to admit exactly the importable names."""
+    from agent.sandbox import checker
+
+    source = BUILD_SCRIPT.read_text(encoding="utf-8")
+    # distribution names -> the module names a tool imports (the checker's list)
+    expected = {
+        "requests": "requests",
+        "beautifulsoup4": "bs4",
+        "lxml": "lxml",
+        "pyyaml": "yaml",
+        "python-dateutil": "dateutil",
+        "pytz": "pytz",
+        "openpyxl": "openpyxl",
+        "pillow": "PIL",
+        "numpy": "numpy",
+        "pandas": "pandas",
+    }
+    curated = source[source.index('CURATED_PIP="${CURATED_PIP:-') :]
+    curated = curated[: curated.index("}")]
+    for distribution, module in expected.items():
+        assert distribution in curated, f"{distribution} missing from the image list"
+        assert module in checker.THIRD_PARTY_IMPORTS, f"{module} missing from THIRD_PARTY_IMPORTS"
+
+
 def test_the_build_script_targets_stay_in_sync_with_the_checker_and_the_console():
     """One curated list, three consumers: image build, import policy, /help pip."""
     from agent.cli.console import PIP_TARGET
