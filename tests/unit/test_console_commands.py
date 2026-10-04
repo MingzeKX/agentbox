@@ -785,3 +785,135 @@ def test_admin_rejects_a_bad_tier():
     with pytest.raises(admin.ConfigError):
         admin.apply({"permission_tier": "god"})
     assert admin.effective()["permission_tier"] in {"safe", "trusted", "unrestricted"}
+
+
+# ------------------------------------------------------------------ /tools (registry)
+# `/tools` talks to the AI service's registry routes (GET /admin/tools,
+# POST /admin/tools/retire, POST /admin/tools/delete) and never to /admin/config, so these
+# tests stub httpx: they assert the exact URL, method and body the console sends.
+
+
+@pytest.fixture
+def registry(monkeypatch):
+    """A recording stand-in for the AI service's /admin/tools* routes."""
+    sent: list[dict] = []
+    rows = [
+        {"name": "fs.read", "version": 1, "status": "active", "tier": "core", "created_by": "seed"},
+        {"name": "word_count", "version": 2, "status": "active", "tier": "generated", "created_by": "model"},
+        {"name": "word_count", "version": 1, "status": "retired", "tier": "generated", "created_by": "model"},
+    ]
+
+    def get(url, headers=None, timeout=None):  # noqa: ANN001
+        sent.append({"method": "GET", "url": url})
+        return FakeResponse(200, {"ok": True, "count": len(rows), "tools": rows})
+
+    def post(url, headers=None, json=None, timeout=None):  # noqa: ANN001
+        sent.append({"method": "POST", "url": url, "json": json})
+        name = (json or {}).get("name")
+        version = (json or {}).get("version")
+        if "retire" in url:
+            return FakeResponse(200, {"ok": True, "name": name, "version": version, "retired": 1, "remaining": []})
+        return FakeResponse(
+            200,
+            {"ok": True, "name": name, "version": version, "purged": bool((json or {}).get("purge")), "deleted": 1},
+        )
+
+    monkeypatch.setattr("httpx.get", get)
+    monkeypatch.setattr("httpx.post", post)
+    return sent
+
+
+def test_tools_list_groups_by_tier_and_marks_retired(shell, registry):
+    sh, console, _ = shell
+
+    assert sh.handle("/tools") is True
+    out = output(console)
+
+    assert "fs.read" in out and "word_count" in out
+    assert "retired" in out, "a retired version is marked, not hidden"
+    assert "retire" in out and "delete" in out, "the help line shows how to change things"
+    assert registry == [{"method": "GET", "url": f"http://127.0.0.1:{settings.ai_port}/admin/tools"}], (
+        "listing is a single read-only GET"
+    )
+
+
+def test_tools_retire_uses_the_single_active_version(shell, registry):
+    sh, console, _ = shell
+
+    assert sh.handle("/tools retire word_count") is True
+
+    call = registry[-1]
+    assert call["method"] == "POST"
+    assert call["url"].endswith("/admin/tools/retire")
+    assert call["json"] == {"name": "word_count", "version": 2}, "no version -> the only active one"
+    assert "已退休 word_count v2" in output(console)
+
+
+def test_tools_retire_refuses_an_ambiguous_version(shell, registry, monkeypatch):
+    sh, console, _ = shell
+    rows = registry  # the fixture's rows; add a second active version via a fresh response
+
+    def get(url, headers=None, timeout=None):  # noqa: ANN001
+        rows.append({"method": "GET", "url": url})
+        return FakeResponse(
+            200,
+            {
+                "ok": True,
+                "tools": [
+                    {"name": "word_count", "version": 1, "status": "active", "tier": "generated"},
+                    {"name": "word_count", "version": 2, "status": "active", "tier": "generated"},
+                ],
+            },
+        )
+
+    monkeypatch.setattr("httpx.get", get)
+    assert sh.handle("/tools retire word_count") is True
+    assert "多个 active 版本" in output(console), "the operator is told to pick a version"
+    assert not [call for call in rows if call.get("method") == "POST"], "nothing was retired"
+
+
+def test_tools_delete_purge_needs_the_name_typed_back(shell, registry):
+    sh, console, _ = shell
+    answers = iter(["word_count"])
+    sh.console.input = lambda prompt="": next(answers)  # noqa: ARG005
+
+    assert sh.handle("/tools delete word_count --purge") is True
+
+    call = registry[-1]
+    assert call["url"].endswith("/admin/tools/delete")
+    assert call["json"] == {"name": "word_count", "version": 2, "purge": True, "confirm": True}
+    assert "已彻底删除" in output(console)
+
+
+def test_tools_delete_purge_aborts_when_the_name_does_not_match(shell, registry):
+    sh, console, _ = shell
+    sh.console.input = lambda prompt="": "not-the-name"  # noqa: ARG005
+
+    assert sh.handle("/tools delete word_count --purge") is True
+    assert not [call for call in registry if call.get("method") == "POST"], "a refused purge sends nothing"
+    assert "已取消" in output(console)
+
+
+def test_tools_rejects_an_unknown_action(shell, registry):
+    sh, console, _ = shell
+
+    assert sh.handle("/tools explode") is True
+    assert "用法" in output(console)
+    assert registry == [], "a bad action touches nothing"
+
+
+def test_tools_reports_an_unauthorized_registry(shell, monkeypatch):
+    sh, console, _ = shell
+    monkeypatch.setattr("httpx.get", lambda *a, **k: FakeResponse(401, {"ok": False, "error": "unauthorized"}))
+
+    assert sh.handle("/tools") is True
+    assert "AGENT_CONTROL_SECRET" in output(console), "the refusal names the setting to check"
+
+
+def test_tools_help_and_completion_are_discoverable():
+    from agent.cli.console import COMMAND_HELP, complete
+
+    assert "/tools" in COMMAND_HELP["tools"]
+    assert "/tools retire" in COMMAND_HELP["tools"]
+    assert "/tools delete" in COMMAND_HELP["tools"]
+    assert complete("/tools ") == ["/tools list", "/tools retire", "/tools delete"]
