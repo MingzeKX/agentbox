@@ -233,10 +233,10 @@ table inet agentbox {
 NFTNET
 chmod 0644 "${ROOTFS}/etc/agent/nftables-net.conf"
 # /etc is part of the read-only root, so the resolver config lives on the /run tmpfs and
-# /etc/resolv.conf is only a symlink to it (the guest fills it in when a NIC is present).
+# /etc/resolv.conf only points at it.  The symlink is created *after* the python package step
+# below: that step needs a real file to reach the mirror, and a regular file left here would
+# make the guest unable to write its DNS config for ever (the root is read-only).
 install -d "${ROOTFS}/run/agent"
-rm -f "${ROOTFS}/etc/resolv.conf"
-ln -s /run/agent/resolv.conf "${ROOTFS}/etc/resolv.conf"
 # a usable apt source: the operator can `apt-get update && apt-get install ...` when the
 # sandbox network switch is on
 cat > "${ROOTFS}/etc/apt/sources.list" <<'SOURCES'
@@ -315,14 +315,8 @@ else
   read -r -a PACKAGE_LIST <<< "${PACKAGES}"
   PIP_PACKAGES="${PACKAGE_LIST[*]}"
 
-  # The hardening phase already replaced /etc/resolv.conf with the run-time symlink into
-  # /run (which has no resolver during the build), so materialise a real file for pip and
-  # re-create the symlink immediately afterwards -- forgetting that is how the guest ends up
-  # unable to write its DNS config in net mode.
-  if [[ ! -s "${ROOTFS}/etc/resolv.conf" ]]; then
-    rm -f "${ROOTFS}/etc/resolv.conf"
-    cp -f /etc/resolv.conf "${ROOTFS}/etc/resolv.conf" 2>/dev/null || true
-  fi
+  # The resolver is still a real file here (the symlink is created after this step), which is
+  # exactly what pip needs -- the /run tmpfs has no resolver during the build.
   if [[ ! -s "${ROOTFS}/etc/resolv.conf" ]]; then
     echo "!!! the chroot has no resolver config; pip cannot reach ${PIP_INDEX_URL}" >&2
     exit 1
@@ -380,9 +374,10 @@ PY
     | cut -f1 > "${BUILD}/rootfs-size-after-pip"
 fi
 
-# The pip step runs with a real /etc/resolv.conf (see the note there).  Whatever happened
-# above, the image MUST ship the run-time symlink into /run: / is read-only in the guest, so
-# a regular file here means the sandbox can never write its DNS config in net mode.
+# Now that every step that needs a real resolver is done, switch /etc/resolv.conf to the
+# run-time symlink into /run (see the note where /run/agent is created).  This MUST happen:
+# / is read-only in the guest, so a regular file here would make the sandbox unable to write
+# its DNS config in net mode for ever.  The finished image is checked with debugfs below.
 rm -f "${ROOTFS}/etc/resolv.conf"
 ln -s /run/agent/resolv.conf "${ROOTFS}/etc/resolv.conf"
 if [[ ! -L "${ROOTFS}/etc/resolv.conf" ]]; then
