@@ -6,6 +6,23 @@
   这是一层薄封装，只做三件事：
     1. 若控制平面 :8091 或 AI 服务 :8090 没在跑，先调 deploy\windows\start-agent.ps1 -NoStart 之外的一键启动（-NoChat）；
     2. 设置 AGENT_PERSONA=whale（蓝鲸管家人格，见 src\agent\ai\personas\whale.md）；
+    # 人格由 AI 服务端决定（不是这个进程）：通过 /admin/config 设置，它会写进 VM 的 .env
+    $personaSet = $false
+    try {
+        $secretLine = Select-String -Path (Join-Path $PSScriptRoot '.env') -Pattern '^AGENT_CONTROL_SECRET=' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($secretLine) {
+            $secret = ($secretLine.Line -replace '^AGENT_CONTROL_SECRET=', '').Trim()
+            $body = '{"persona":"' + $Persona + '"}'
+            Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8090/admin/config' `
+                -Headers @{ 'X-Agent-Token' = $secret } -ContentType 'application/json' -Body $body -TimeoutSec 20 | Out-Null
+            Write-Host "  已设置人格：$Persona（服务端，已持久化到 VM 的 .env）" -ForegroundColor Green
+            $personaSet = $true
+        }
+    } catch {
+        Write-Host "  人格设置失败（可在对话里用 /persona $Persona 手动切换）：$_" -ForegroundColor Yellow
+    }
+    if (-not $personaSet) { Write-Host "  提示：进去后可用 /persona $Persona 切换人格" -ForegroundColor DarkGray }
+
     3. 用仓库自己的 .venv\Scripts\python.exe 跑 python -m agent.cli chat。
 
   它不改任何配置、不碰 .env、不重启已经在跑的服务；服务启动的细节与耗时表
