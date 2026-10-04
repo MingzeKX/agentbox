@@ -20,12 +20,24 @@ BASE = "# Role\n\nYou are an autonomous engineering agent.\n\n# Resident tools\n
 
 def test_all_bundled_personas_load():
     found = personas.available()
-    for expected in ("engineer", "roleplay", "teacher", "reviewer", "concise"):
+    for expected in ("engineer", "roleplay", "teacher", "reviewer", "concise", "whale"):
         assert expected in found, found
     for name in found:
         persona = personas.load(name)
         assert persona.name == name
         assert persona.text.strip(), f"{name} has an empty body"
+
+
+def test_whale_persona_is_bundled_loadable_and_within_the_cap():
+    """`whale` ships with the package, loads as itself, and survives the body cap."""
+    found = personas.available()
+    assert found.get("whale") == "bundled", found
+
+    persona = personas.load("whale")
+    assert persona.name == "whale"
+    assert persona.source == "bundled"
+    assert persona.text.strip(), "whale has an empty body"
+    assert len(persona.text) <= personas.MAX_PERSONA_CHARS
 
 
 def test_persona_is_appended_after_the_base_contract():
