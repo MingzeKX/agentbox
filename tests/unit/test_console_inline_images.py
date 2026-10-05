@@ -110,6 +110,8 @@ def test_inline_images_are_pulled_like_get_capped_deduped_and_degrade_without_pi
         return {"ok": True, "path": str(tmp_path / "pulled" / str(params["dest"])), "bytes": len(payload)}
 
     monkeypatch.setattr("agent.cli.main._control_rpc", fake_rpc)
+    # the name is allocated against the real var\pulled, so pin it to this test's tmp dir
+    monkeypatch.setattr("agent.cli.console.pulled_root", lambda: tmp_path / "pulled")
 
     shown = sh.show_inline_images("图：/workspace/a.png、/workspace/b.png、/workspace/c.png")
 

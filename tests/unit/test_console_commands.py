@@ -966,6 +966,7 @@ def test_get_hands_the_bytes_to_the_control_plane_and_never_admin_config(shell, 
         return {"ok": True, "path": str(tmp_path / "pulled" / "plot.png"), "bytes": len(payload)}
 
     monkeypatch.setattr("agent.cli.main._control_rpc", fake_rpc)
+    monkeypatch.setattr("agent.cli.console.pulled_root", lambda: tmp_path / "pulled")
     monkeypatch.setattr("subprocess.run", lambda argv, **kw: opened.append(list(argv)))
 
     assert sh.handle("/get /workspace/plot.png") is True
@@ -1033,6 +1034,7 @@ def test_get_accepts_the_live_fs_read_payload_shape(shell, tmp_path, monkeypatch
         return {"ok": True, "path": str(tmp_path / "pulled" / "acg.jpg"), "bytes": len(payload)}
 
     monkeypatch.setattr("agent.cli.main._control_rpc", fake_rpc)
+    monkeypatch.setattr("agent.cli.console.pulled_root", lambda: tmp_path / "pulled")
     monkeypatch.setattr("subprocess.run", lambda argv, **kw: opened.append(list(argv)))
 
     assert sh.handle("/get /workspace/acg.jpg") is True
@@ -1049,11 +1051,14 @@ def test_get_reports_the_host_refusal_and_opens_pulled_images_once(shell, tmp_pa
     """Regression (live: ``/get /workspace/acg.jpg`` said 控制平面不可达).
 
     The control plane was up and answered -- ``host.pull.write`` refused because
-    ``var\\pulled\\acg.jpg`` already existed (code 1001).  That refusal must reach the
-    operator as itself, with the remedy they can type, and ``--overwrite`` must be handed to
-    the writer as ``overwrite: true`` so the retry works.  A picture that lands is also
+    `var\\pulled\\acg.jpg` already existed (code 1001).  That refusal must reach the
+    operator as itself, with the remedy they can type, and `--overwrite` must be handed to
+    the writer as `overwrite: true` so the retry works.  A picture that lands is also
     opened with the system viewer -- once per file per session, never for a non-image, and
-    not at all with ``AGENT_OPEN_PULLED_IMAGES=0``.
+    not at all with `AGENT_OPEN_PULLED_IMAGES=0`.
+
+    The refusal is asked for with an *explicit* destination: a default one would now be
+    renamed (``acg-2.jpg``) instead of refused, which is its own test below.
     """
     sh, console, state = shell
     state.session_id = "s-test"
@@ -1086,12 +1091,14 @@ def test_get_reports_the_host_refusal_and_opens_pulled_images_once(shell, tmp_pa
         return {"ok": True, "path": str(target), "bytes": len(payload)}
 
     monkeypatch.setattr("agent.cli.main._control_rpc", fake_rpc)
+    monkeypatch.setattr("agent.cli.console.pulled_root", lambda: tmp_path / "pulled")
     monkeypatch.setattr("subprocess.run", lambda argv, **kw: opened.append(list(argv)))
 
     def starts() -> int:
         return sum("Start-Process" in call for call in opened)
 
-    assert sh.handle("/get /workspace/acg.jpg") is True
+    # an explicit destination keeps the old semantics: the writer's refusal is the answer
+    assert sh.handle("/get /workspace/acg.jpg acg.jpg") is True
     text = output(console)
     assert "已存在同名文件" in text, "the host's own refusal must be reported, not a guess"
     assert "--overwrite" in text, "the remedy has to be one the operator can type"
@@ -1116,4 +1123,70 @@ def test_get_reports_the_host_refusal_and_opens_pulled_images_once(shell, tmp_pa
     monkeypatch.setattr("agent.cli.console.pulled_image_auto_open_enabled", lambda: False)
     assert sh.handle("/get /workspace/second.png") is True
     assert starts() == 1, "AGENT_OPEN_PULLED_IMAGES=0 keeps the picture on disk only"
+
+
+def test_a_default_get_takes_the_next_free_name_so_a_second_pull_always_lands(shell, tmp_path, monkeypatch):
+    """Regression (live: 发图片时好时坏 / ``/get`` 每次文件名都一样、重叠).
+
+    ``var\\pulled`` is never cleaned, so with no destination from the operator the host writer
+    refused the second pull of the same sandbox path (code 1001) and the file simply did not
+    appear -- which is exactly what made inline images work "sometimes".  A default
+    destination must be unique (``acg.jpg`` -> ``acg-2.jpg``), an explicit ``--overwrite``
+    must still name that same file, a refusal the pre-check could not see must fall back to
+    one more free name, and the inline view must use the same allocation.
+    """
+    sh, console, state = shell
+    state.session_id = "s-test"
+    payload = b"\xff\xd8\xff\xe0" + b"jpg" * 40
+    root = tmp_path / "pulled"
+    writes: list[dict] = []
+
+    def fake_rpc(method, params=None, timeout=120.0):  # noqa: ANN001
+        if method == "sandbox.invoke":
+            return {
+                "ok": True,
+                "result": {
+                    "path": str(params["params"]["path"]),
+                    "size": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "truncated": False,
+                    "data_b64": base64.b64encode(payload).decode("ascii"),
+                },
+            }
+        writes.append(dict(params or {}))
+        target = root / str(params["dest"])  # the writer's own rule, in one place
+        if target.exists() and not params.get("overwrite"):
+            raise SystemExit(
+                f"host.pull.write failed: [1001] {target} already exists; pass overwrite=true to replace it"
+            )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(base64.b64decode(str(params["data_b64"])))
+        return {"ok": True, "path": str(target), "bytes": len(payload)}
+
+    monkeypatch.setattr("agent.cli.main._control_rpc", fake_rpc)
+    monkeypatch.setattr("agent.cli.console.pulled_root", lambda: root)
+    monkeypatch.setattr("subprocess.run", lambda argv, **kw: None)
+
+    assert sh.handle("/get /workspace/acg.jpg") is True
+    assert writes[-1]["dest"] == "acg.jpg" and (root / "acg.jpg").is_file()
+
+    assert sh.handle("/get /workspace/acg.jpg") is True, "the second pull must still land"
+    assert writes[-1]["dest"] == "acg-2.jpg", "a default destination must never collide"
+    assert (root / "acg-2.jpg").is_file()
+    assert "acg-2.jpg" in output(console), "the operator is told where it really landed"
+
+    assert sh.handle("/get /workspace/acg.jpg --overwrite") is True
+    assert writes[-1]["dest"] == "acg.jpg" and writes[-1]["overwrite"] is True, "--overwrite means that name"
+
+    # a refusal the pre-check could not see (a race, or a plane whose var\ is not ours):
+    # one more free name is taken instead of dropping the file
+    (root / "race.jpg").write_bytes(payload)
+    monkeypatch.setattr("agent.cli.console.pulled_root", lambda: tmp_path / "elsewhere")
+    assert sh.handle("/get /workspace/race.jpg") is True
+    assert writes[-1]["dest"] == "race-2.jpg", "a refused default name falls back once"
+
+    # the inline view is the same pull: an existing name must never cost the operator the picture
+    monkeypatch.setattr("agent.cli.console.pulled_root", lambda: root)
+    assert sh.show_inline_images("/workspace/acg.jpg") == 1
+    assert writes[-1]["dest"] == "acg-3.jpg", "inline images use the same unique allocation"
 

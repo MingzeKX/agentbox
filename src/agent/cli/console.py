@@ -160,6 +160,10 @@ GET_OVERWRITE_FLAGS = ("--overwrite", "-f", "--force")
 OPEN_PULLED_IMAGES_ENV = "AGENT_OPEN_PULLED_IMAGES"
 #: where pulled files land when the control plane does not say (the AI-side default)
 GET_FALLBACK_ROOT = "var\\pulled"
+#: a default destination never collides with an earlier pull: ``acg.jpg`` -> ``acg-2.jpg``
+GET_UNIQUE_SUFFIX_START = 2
+#: how many ``-<n>`` names to try before handing the host writer's own refusal back
+GET_UNIQUE_ATTEMPTS = 1000
 
 #: how many images one turn may add to the transcript: the reply is the answer, and a wall
 #: of pictures buries it.  The renderer keeps the same per-turn budget (StepRenderer.image_limit).
@@ -207,6 +211,15 @@ def _control_refusal(exc: BaseException) -> tuple[str, str] | None:
     return match.group("code"), match.group("message").strip()
 
 
+class PullExistsError(RuntimeError):
+    """The host writer refused a destination that already exists (its code 1001).
+
+    A ``RuntimeError`` so every caller keeps reporting it exactly as before; the subclass is
+    what lets :meth:`SlashConsole._get_pull` recognise the one refusal it can fix itself, by
+    pulling under the next free name instead of dropping the file.
+    """
+
+
 def _control_failure(exc: BaseException, *, unreachable: str) -> RuntimeError:
     """The ``RuntimeError`` ``/get``, ``/pip`` and the pull helpers show for a failed call.
 
@@ -219,7 +232,7 @@ def _control_failure(exc: BaseException, *, unreachable: str) -> RuntimeError:
         return RuntimeError(f"控制平面不可达（{exc}）。{unreachable}")
     code, message = refusal
     if code == str(PULL_EXISTS_CODE) or "already exists" in message.lower():
-        return RuntimeError(
+        return PullExistsError(
             "已存在同名文件，未覆盖。加 --overwrite 重试，或换个目标名："
             f"/get <path> <other-name> --overwrite（控制面原话：{message}）"
         )
@@ -265,6 +278,57 @@ def pulled_image_auto_open_enabled() -> bool:
     if raw is None:
         return True
     return raw.strip().strip("\"'").lower() not in {"0", "false", "no", "off"}
+
+
+def pulled_root() -> Path:
+    """Where the host writer really lands a pulled file: ``<var_dir>/pulled``.
+
+    The console reads the same ``.env`` as the control plane, so this is
+    ``agent.control.host.pull.pull_dir`` -- the directory whose ``already exists`` refusal
+    :func:`unique_pull_dest` avoids in the first place.
+    """
+    return Path(settings.var_dir).resolve() / "pulled"
+
+
+def _numbered_pull_dest(dest: str, index: int) -> str:
+    """``acg.jpg`` at 2 -> ``acg-2.jpg``; a subdirectory (``report/a.csv``) is kept.
+
+    The suffix goes before the extension (that is the name an operator recognises) and after
+    the directory, which is what keeps ``report/a.csv`` -> ``report/a-2.csv``.
+    """
+    directory, _, name = dest.rpartition("/")
+    stem, dot, suffix = name.rpartition(".")
+    if not dot or not stem:  # no extension, or a dotfile like ``.env``: number the whole name
+        stem, dot, suffix = name, "", ""
+    numbered = f"{stem}-{index}{dot}{suffix}"
+    return f"{directory}/{numbered}" if directory else numbered
+
+
+def _pulled_dest_exists(dest: str) -> bool:
+    """Whether this host already has ``var\\pulled\\<dest>`` (checked before asking the plane)."""
+    try:
+        return (pulled_root() / Path(*dest.split("/"))).exists()
+    except OSError:  # an unreadable var\pulled is not a reason to refuse the pull
+        return False
+
+
+def unique_pull_dest(dest: str, *, taken: frozenset[str] = frozenset()) -> str:
+    """``dest`` itself when it is free, else the first free ``-<n>`` name in its family.
+
+    A default destination (no operator-supplied name) must never lose the file to an earlier
+    pull: nothing ever deletes ``var\\pulled``, so the second ``/get /workspace/acg.jpg`` -- and
+    the second inline view of the same picture -- was answered by the host writer with code
+    1001 and silently did nothing.  ``acg.jpg`` -> ``acg-2.jpg`` -> ``acg-3.jpg``, in order and
+    deterministic.  ``taken`` holds a destination the writer refused *after* this check (a
+    race); if every name is used the original is returned and the writer's refusal is reported.
+    """
+    if dest not in taken and not _pulled_dest_exists(dest):
+        return dest
+    for index in range(GET_UNIQUE_SUFFIX_START, GET_UNIQUE_SUFFIX_START + GET_UNIQUE_ATTEMPTS):
+        candidate = _numbered_pull_dest(dest, index)
+        if candidate not in taken and not _pulled_dest_exists(candidate):
+            return candidate
+    return dest
 
 
 def _pulled_host_path(path: Path | str) -> Path:
@@ -469,7 +533,8 @@ COMMAND_HELP: dict[str, str] = {
   所以 AI 服务挂了也能用；AI 服务自己在工具里用的是 [cyan]fs.pull[/cyan]。
 * 只允许 /workspace 下的文件，单个文件上限 [bold]8 MB[/bold]（AGENT_FS_PULL_MAX_BYTES）。
 * 目标名只能是 [bold]var\\pulled[/bold] 下的相对路径：不允许 `..`、不允许绝对路径。
-* 同名文件已存在会拒绝，加 [cyan]--overwrite[/cyan] 才覆盖。
+* 不写目标名时默认自动改名避免覆盖（[cyan]acg.jpg[/cyan] -> [cyan]acg-2.jpg[/cyan]）；
+  自己写了目标名则同名会拒绝，加 [cyan]--overwrite[/cyan] 才按原名覆盖。
 * 图片（png/jpg/jpeg/gif/webp/bmp）落地后会用默认看图程序打开（内嵌渲染的图也一样，
   每张只弹一次）；`.env` 里 [cyan]AGENT_OPEN_PULLED_IMAGES=0[/cyan] 可关掉自动打开。""",
     "persona": """[cyan]/persona[/cyan]                        列出所有角色扮演并显示当前生效的那个
@@ -1341,11 +1406,16 @@ class SlashConsole:
             path = f"/workspace/{path}"
         if not re.fullmatch(r"/workspace(/[^/\x00]+)*", path) or ".." in path.split("/"):
             raise RuntimeError(f"只能取 /workspace 下的文件（收到 {items[0]!r}）")
-        dest = items[1].strip().replace("\\", "/") if len(items) > 1 else path.rsplit("/", 1)[-1]
+        explicit_dest = len(items) > 1
+        dest = items[1].strip().replace("\\", "/") if explicit_dest else path.rsplit("/", 1)[-1]
         if dest.startswith("/") or ":" in dest or ".." in dest.split("/"):
             raise RuntimeError(r"目标名只能是 var\pulled 下的相对路径（不允许 .. 或绝对路径）")
 
-        host_path, payload, digest = self._get_pull(path, dest, overwrite=overwrite)
+        # No name from the operator: never overwrite an earlier pull, take the next free name.
+        # ``--overwrite`` still means "this exact name" (and an explicit dest keeps its meaning).
+        host_path, payload, digest = self._get_pull(
+            path, dest, overwrite=overwrite, unique=not explicit_dest and not overwrite
+        )
         self.console.print(
             f"[green]已保存[/green]: [bold]{host_path}[/bold] ({_pip_bytes(len(payload))}, sha256 {digest})"
         )
@@ -1370,12 +1440,14 @@ class SlashConsole:
             self._inline_seen.add(path)
             name = path.rsplit("/", 1)[-1]
             try:
-                host_path, payload, _digest = self._get_pull(path, name)
+                # inline: an existing name must never cost the operator the picture
+                host_path, payload, _digest = self._get_pull(path, name, unique=True)
             except Exception as exc:  # noqa: BLE001 - a picture must never break a turn
                 self.console.print(f"[yellow]图片 {path} 取不回来：{exc}[/yellow]")
                 continue
             render_image_blocks(self.console, host_path)
-            self.console.print(f"图片: {GET_FALLBACK_ROOT}\\{name} ({len(payload)} 字节)")
+            landed = Path(host_path).name or name
+            self.console.print(f"图片: {GET_FALLBACK_ROOT}\\{landed} ({len(payload)} 字节)")
             if Path(host_path).is_file():
                 # inline rendering needs Pillow, the system viewer does not: once the bytes
                 # are really on this host, show the picture itself (once per file per session)
@@ -1383,14 +1455,31 @@ class SlashConsole:
             painted += 1
         return painted
 
-    def _get_pull(self, path: str, dest: str, *, overwrite: bool = False) -> tuple[str, bytes, str]:
+    def _write_pulled(self, dest: str, payload: bytes, *, overwrite: bool) -> dict[str, Any]:
+        """Hand one whole file to ``host.pull.write``, one protocol frame per chunk."""
+        chunks = [
+            payload[start : start + GET_READ_CHUNK_BYTES]
+            for start in range(0, len(payload), GET_READ_CHUNK_BYTES)
+        ] or [b""]
+        written: dict[str, Any] = {}
+        for index, chunk in enumerate(chunks):
+            written = self._get_write(dest, chunk, append=index > 0, overwrite=overwrite)
+        return written
+
+    def _get_pull(
+        self, path: str, dest: str, *, overwrite: bool = False, unique: bool = False
+    ) -> tuple[str, bytes, str]:
         """Read ``path`` out of the session sandbox into ``var\\pulled\\<dest>``.
 
         The console half of ``fs.pull``, shared by ``/get`` and the inline image view: guest
         ``fs.read`` (binary chunks), then the control plane's ``host.pull.write``, which is
         also what confines the write to ``var\\pulled`` and enforces the 8 MB pull cap
         (``AGENT_FS_PULL_MAX_BYTES``) -- the console never decides the destination itself.
-        Returns ``(host path, bytes, sha256)``.
+
+        ``unique`` is for a destination the operator did not name: the first free name in
+        ``dest``'s family is used (:func:`unique_pull_dest`), and if the writer refuses that
+        name anyway (a race, or a plane whose ``var`` is not ours) one more free name is tried
+        before the refusal is reported.  Returns ``(host path, bytes, sha256)``.
         """
         session = self._sandbox_session()
         chunks: list[bytes] = []
@@ -1439,13 +1528,17 @@ class SlashConsole:
                 break
         payload = b"".join(chunks)
 
-        written: dict[str, Any] = {}
-        chunks_out = [
-            payload[start : start + GET_READ_CHUNK_BYTES]
-            for start in range(0, len(payload), GET_READ_CHUNK_BYTES)
-        ] or [b""]
-        for index, chunk in enumerate(chunks_out):
-            written = self._get_write(dest, chunk, append=index > 0, overwrite=overwrite)
+        if unique:
+            dest = unique_pull_dest(dest)
+        try:
+            written = self._write_pulled(dest, payload, overwrite=overwrite)
+        except PullExistsError:
+            if not unique:
+                raise
+            # the pre-check cannot see a name created since (or on the plane's own root):
+            # take one more free name rather than losing the file the operator asked for
+            dest = unique_pull_dest(dest, taken=frozenset({dest}))
+            written = self._write_pulled(dest, payload, overwrite=overwrite)
         host_path = str(written.get("path") or "")
         if not host_path:
             raise RuntimeError("控制面没有返回宿主机路径")

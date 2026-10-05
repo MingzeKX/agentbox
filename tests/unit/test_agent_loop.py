@@ -211,7 +211,7 @@ def test_system_prompt_pins_authorization_and_honesty_after_the_persona():
     assert "/get <沙箱路径>" in prompt
     assert "默认是联网的" in prompt
     assert "/net allow <域名>" in prompt
-    for rule in ("`fs.pull` 推到主机的", "默认是联网的"):
+    for rule in ("`fs.pull` 推到主机的", "默认是联网的", "每一张图都要在回答里把沙箱路径原样写出来"):
         assert prompt.index(rule) > persona_at
 
 

@@ -151,7 +151,8 @@ powershell -ExecutionPolicy Bypass -File .\deploy\windows\stop-agent.ps1
 > `fs.read`，写控制面 RPC **`host.pull.write`**，**不经过 AI 服务的 `/admin/config`**，
 > 所以 AI 服务挂了也能取。只允许 `/workspace` 下的文件，单个文件上限 **8 MB**
 > （`AGENT_FS_PULL_MAX_BYTES`）；目标名只能是 `var\pulled\` 下的相对路径
-> （不允许 `..` 或绝对路径，子目录会自动建）；同名文件已存在会拒绝，加 `--overwrite` 才覆盖。
+> （不允许 `..` 或绝对路径，子目录会自动建）；不写目标名时默认自动改名避免覆盖
+> （`acg.jpg` → `acg-2.jpg`），要覆盖同名就加 `--overwrite`。
 > 图片（png/jpg/jpeg/gif/webp/bmp）取完后用默认看图程序打开。AI 自己生成图片/文件后
 > 也可以直接调 `fs.pull`，效果一样。
 
