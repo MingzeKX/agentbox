@@ -1044,3 +1044,76 @@ def test_get_accepts_the_live_fs_read_payload_shape(shell, tmp_path, monkeypatch
     assert "已保存" in text and "acg.jpg" in text and hashlib.sha256(payload).hexdigest()[:16] in text
     assert opened and "Start-Process" in opened[0]
 
+
+def test_get_reports_the_host_refusal_and_opens_pulled_images_once(shell, tmp_path, monkeypatch):
+    """Regression (live: ``/get /workspace/acg.jpg`` said 控制平面不可达).
+
+    The control plane was up and answered -- ``host.pull.write`` refused because
+    ``var\\pulled\\acg.jpg`` already existed (code 1001).  That refusal must reach the
+    operator as itself, with the remedy they can type, and ``--overwrite`` must be handed to
+    the writer as ``overwrite: true`` so the retry works.  A picture that lands is also
+    opened with the system viewer -- once per file per session, never for a non-image, and
+    not at all with ``AGENT_OPEN_PULLED_IMAGES=0``.
+    """
+    sh, console, state = shell
+    state.session_id = "s-test"
+    payload = b"\xff\xd8\xff\xe0" + b"jpg" * 40
+    refusals = [
+        "host.pull.write failed: [1001] C:\\Users\\86133\\Desktop\\Agent\\var\\pulled\\acg.jpg"
+        " already exists; pass overwrite=true to replace it"
+    ]
+    writes: list[dict] = []
+    opened: list[list[str]] = []
+
+    def fake_rpc(method, params=None, timeout=120.0):  # noqa: ANN001
+        if method == "sandbox.invoke":
+            return {
+                "ok": True,
+                "result": {
+                    "path": str(params["params"]["path"]),
+                    "size": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "truncated": False,
+                    "data_b64": base64.b64encode(payload).decode("ascii"),
+                },
+            }
+        writes.append(dict(params or {}))
+        if refusals:
+            raise SystemExit(refusals.pop(0))
+        target = tmp_path / "pulled" / str(params["dest"])
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+        return {"ok": True, "path": str(target), "bytes": len(payload)}
+
+    monkeypatch.setattr("agent.cli.main._control_rpc", fake_rpc)
+    monkeypatch.setattr("subprocess.run", lambda argv, **kw: opened.append(list(argv)))
+
+    def starts() -> int:
+        return sum("Start-Process" in call for call in opened)
+
+    assert sh.handle("/get /workspace/acg.jpg") is True
+    text = output(console)
+    assert "已存在同名文件" in text, "the host's own refusal must be reported, not a guess"
+    assert "--overwrite" in text, "the remedy has to be one the operator can type"
+    assert "控制平面不可达" not in text, "the plane answered; it was never unreachable"
+    assert "start-agent.cmd" not in text, "never send the operator to restart a running service"
+    assert starts() == 0, "nothing landed, so nothing may be opened"
+
+    assert sh.handle("/get /workspace/acg.jpg --overwrite") is True
+    assert writes[-1]["overwrite"] is True, "--overwrite must reach host.pull.write"
+    assert writes[-1]["append"] is False and writes[-1]["dest"] == "acg.jpg"
+    assert base64.b64decode(writes[-1]["data_b64"]) == payload
+    text = output(console)
+    assert "已保存" in text and "已打开：" in text, "the picture itself is the delivery"
+    assert starts() == 1
+
+    assert sh.handle("/get /workspace/acg.jpg --overwrite") is True
+    assert starts() == 1, "one picture must not pop a second viewer per session"
+
+    assert sh.handle("/get /workspace/notes.txt") is True
+    assert starts() == 1, "a pulled file that is not an image must not be opened"
+
+    monkeypatch.setattr("agent.cli.console.pulled_image_auto_open_enabled", lambda: False)
+    assert sh.handle("/get /workspace/second.png") is True
+    assert starts() == 1, "AGENT_OPEN_PULLED_IMAGES=0 keeps the picture on disk only"
+

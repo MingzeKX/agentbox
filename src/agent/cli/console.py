@@ -19,6 +19,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -155,6 +156,8 @@ GET_READ_CHUNK_BYTES = 1_000_000
 GET_IMAGE_SUFFIXES: tuple[str, ...] = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
 #: how ``/get`` may be told to replace a file that is already in var\pulled
 GET_OVERWRITE_FLAGS = ("--overwrite", "-f", "--force")
+#: ``AGENT_OPEN_PULLED_IMAGES=0`` (environment or .env) keeps a pulled picture on disk only
+OPEN_PULLED_IMAGES_ENV = "AGENT_OPEN_PULLED_IMAGES"
 #: where pulled files land when the control plane does not say (the AI-side default)
 GET_FALLBACK_ROOT = "var\\pulled"
 
@@ -181,6 +184,48 @@ def _control_rpc(method: str, params: dict[str, Any] | None = None, timeout: flo
     return call(method, params, timeout)
 
 
+#: the host writer's own refusal for a destination that is already in ``var\pulled``
+PULL_EXISTS_CODE = 1001
+#: the shape ``_control_rpc`` gives a JSON-RPC refusal from a plane that *did* answer:
+#: ``"<method> failed: [<code>] <message>"`` (a transport failure says something else)
+CONTROL_REFUSAL_RE = re.compile(r"failed:\s*\[(?P<code>-?\d+)\]\s*(?P<message>.*)", re.DOTALL)
+
+
+def _control_refusal(exc: BaseException) -> tuple[str, str] | None:
+    """``(code, message)`` when the control plane itself answered with a refusal.
+
+    ``_control_rpc`` raises ``SystemExit`` for two very different failures: the transport
+    never connected (``control plane unreachable at ...``), and the plane answering with its
+    own error (``host.pull.write failed: [1001] ... already exists; pass overwrite=true``).
+    ``None`` means the call never reached a running plane.  Only the transport case is
+    "unreachable": telling the operator to restart a service that just answered was the live
+    bug.
+    """
+    match = CONTROL_REFUSAL_RE.search(str(exc))
+    if match is None:
+        return None
+    return match.group("code"), match.group("message").strip()
+
+
+def _control_failure(exc: BaseException, *, unreachable: str) -> RuntimeError:
+    """The ``RuntimeError`` ``/get``, ``/pip`` and the pull helpers show for a failed call.
+
+    A structured refusal is reported as itself -- ``host.pull.write`` saying the destination
+    exists becomes the exact remedy (``--overwrite``, or another name) instead of a restart
+    hint for a control plane that is demonstrably up.
+    """
+    refusal = _control_refusal(exc)
+    if refusal is None:
+        return RuntimeError(f"控制平面不可达（{exc}）。{unreachable}")
+    code, message = refusal
+    if code == str(PULL_EXISTS_CODE) or "already exists" in message.lower():
+        return RuntimeError(
+            "已存在同名文件，未覆盖。加 --overwrite 重试，或换个目标名："
+            f"/get <path> <other-name> --overwrite（控制面原话：{message}）"
+        )
+    return RuntimeError(f"控制面拒绝了这次调用：[{code}] {message}")
+
+
 def scan_image_paths(text: str) -> list[str]:
     """Every distinct ``/workspace`` image path in ``text``, in first-seen order.
 
@@ -195,6 +240,31 @@ def scan_image_paths(text: str) -> list[str]:
         if path not in found:
             found.append(path)
     return found
+
+
+def pulled_image_auto_open_enabled() -> bool:
+    """Whether a pulled picture is also opened with the system viewer (default: yes).
+
+    The operator asked for the picture, not for a path, so ``/get`` and the inline view hand
+    the file to the Windows viewer as soon as it has landed.  ``AGENT_OPEN_PULLED_IMAGES=0``
+    -- in the environment or in the repository ``.env`` -- keeps it on disk only.  The
+    settings model ignores keys it does not declare (``extra="ignore"``), so a value that is
+    only in ``.env`` is read here.
+    """
+    raw = os.environ.get(OPEN_PULLED_IMAGES_ENV)
+    if raw is None:
+        try:
+            lines = (project_root() / ".env").read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            lines = []
+        for line in lines:
+            key, _, value = line.partition("=")
+            if key.strip() == OPEN_PULLED_IMAGES_ENV:
+                raw = value.strip()
+                break
+    if raw is None:
+        return True
+    return raw.strip().strip("\"'").lower() not in {"0", "false", "no", "off"}
 
 
 def _pulled_host_path(path: Path | str) -> Path:
@@ -391,7 +461,7 @@ COMMAND_HELP: dict[str, str] = {
 
 `host.exec` 还需要控制面设置 AGENT_PERMISSION_TIER=unrestricted，并且
 它运行的每一条命令都会被记录下来。""",
-    "get": """[cyan]/get <沙箱路径> [目标名][/cyan]     把沙箱里 AI 生成的文件取到本机
+    "get": """[cyan]/get <沙箱路径> [目标名] [--overwrite|-f][/cyan]     把沙箱里 AI 生成的文件取到本机
 [cyan]/get /workspace/plot.png[/cyan]     取到 var\\pulled\\plot.png，并用默认看图程序打开
 [cyan]/get /workspace/out.csv report/a.csv[/cyan]  放到 var\\pulled\\report\\a.csv（子目录会自动建）
 
@@ -400,7 +470,8 @@ COMMAND_HELP: dict[str, str] = {
 * 只允许 /workspace 下的文件，单个文件上限 [bold]8 MB[/bold]（AGENT_FS_PULL_MAX_BYTES）。
 * 目标名只能是 [bold]var\\pulled[/bold] 下的相对路径：不允许 `..`、不允许绝对路径。
 * 同名文件已存在会拒绝，加 [cyan]--overwrite[/cyan] 才覆盖。
-* 图片（png/jpg/jpeg/gif/webp/bmp）会用默认看图程序打开。""",
+* 图片（png/jpg/jpeg/gif/webp/bmp）落地后会用默认看图程序打开（内嵌渲染的图也一样，
+  每张只弹一次）；`.env` 里 [cyan]AGENT_OPEN_PULLED_IMAGES=0[/cyan] 可关掉自动打开。""",
     "persona": """[cyan]/persona[/cyan]                        列出所有角色扮演并显示当前生效的那个
 [cyan]/persona roleplay[/cyan]               切换（内置：engineer、roleplay、teacher、
                                  reviewer、concise）
@@ -694,6 +765,8 @@ class SlashConsole:
         self.state = state
         #: sandbox paths already shown inline, so one picture is pulled once per session
         self._inline_seen: set[str] = set()
+        #: host files already handed to the system viewer, so a picture never pops twice
+        self._opened_images: set[str] = set()
 
     # ------------------------------------------------------------------ transport
     def _headers(self) -> dict[str, str]:
@@ -1247,9 +1320,12 @@ class SlashConsole:
                 timeout=120.0,
             )
         except SystemExit as exc:  # _control_rpc raises SystemExit when the plane is down
-            raise RuntimeError(
-                f"控制平面不可达（{exc}）。取文件必须经过控制平面 —— "
-                r"确认它在跑：.\start-agent.cmd，或 .\.venv\Scripts\python -m agent.cli serve control"
+            raise _control_failure(
+                exc,
+                unreachable=(
+                    r"取文件必须经过控制平面 —— 确认它在跑：.\start-agent.cmd，"
+                    r"或 .\.venv\Scripts\python -m agent.cli serve control"
+                ),
             ) from exc
 
     def _cmd_get(self, args: list[str]) -> None:  # noqa: ARG002
@@ -1258,7 +1334,7 @@ class SlashConsole:
         overwrite = len(items) != len(args)
         if not items:
             raise RuntimeError(
-                r"用法：/get <沙箱路径> [目标名] [--overwrite]　例：/get /workspace/plot.png"
+                r"用法：/get <沙箱路径> [目标名] [--overwrite|-f]　例：/get /workspace/plot.png --overwrite"
             )
         path = items[0].strip().replace("\\", "/")
         if not path.startswith("/"):
@@ -1300,6 +1376,10 @@ class SlashConsole:
                 continue
             render_image_blocks(self.console, host_path)
             self.console.print(f"图片: {GET_FALLBACK_ROOT}\\{name} ({len(payload)} 字节)")
+            if Path(host_path).is_file():
+                # inline rendering needs Pillow, the system viewer does not: once the bytes
+                # are really on this host, show the picture itself (once per file per session)
+                self._open_image(host_path)
             painted += 1
         return painted
 
@@ -1335,8 +1415,8 @@ class SlashConsole:
                     timeout=180.0,
                 )
             except SystemExit as exc:
-                raise RuntimeError(
-                    f"控制平面不可达（{exc}）—— 沙箱读取也要经过它；确认控制平面在跑"
+                raise _control_failure(
+                    exc, unreachable="沙箱读取也要经过它；确认控制平面在跑"
                 ) from exc
             # ``_control_rpc`` already stripped the JSON-RPC envelope, so ``body`` *is* the
             # SandboxInvokeResult (``{"ok": ..., "result": {...}}``) and ``result`` is the
@@ -1372,7 +1452,18 @@ class SlashConsole:
         return host_path, payload, digest.hexdigest()
 
     def _open_image(self, host_path: str) -> None:
-        """Show the pulled image with the Windows default viewer (best effort)."""
+        """Hand a pulled picture to the Windows viewer -- once per session, best effort.
+
+        The operator asked for the picture, not for a path, so a pull that lands an image
+        also opens it (``AGENT_OPEN_PULLED_IMAGES=0`` turns that off).  Every failure is a
+        hint and never an error: the file is on disk and the "已保存" line already said so.
+        """
+        if not pulled_image_auto_open_enabled():
+            return
+        key = os.path.normcase(os.path.abspath(host_path))
+        if key in self._opened_images:
+            return
+        self._opened_images.add(key)
         executable = powershell_executable()
         if not executable:
             self.console.print("[yellow]没找到 powershell.exe，无法自动打开；请手动双击上面的路径[/yellow]")
@@ -1387,7 +1478,7 @@ class SlashConsole:
         except (OSError, subprocess.SubprocessError) as exc:
             self.console.print(f"[yellow]无法自动打开图片（{exc}）；请手动双击上面的路径[/yellow]")
             return
-        self.console.print("[dim]已用默认看图程序打开[/dim]")
+        self.console.print(f"[dim]已打开：{host_path}[/dim]")
 
     # ------------------------------------------------------------------------ pip
     def _sandbox_session(self) -> str:
@@ -1418,9 +1509,12 @@ class SlashConsole:
                 timeout=timeout + 60.0,
             )
         except SystemExit as exc:  # _control_rpc raises SystemExit when the plane is down
-            raise RuntimeError(
-                f"控制平面不可达（{exc}）。沙箱装包必须经过控制平面 —— "
-                "确认控制平面在跑：.\\start-agent.cmd，或 .\\.venv\\Scripts\\python -m agent.cli serve control"
+            raise _control_failure(
+                exc,
+                unreachable=(
+                    r"沙箱装包必须经过控制平面 —— 确认它在跑：.\start-agent.cmd，"
+                    r"或 .\.venv\Scripts\python -m agent.cli serve control"
+                ),
             ) from exc
         outcome = (body or {}).get("result") or {}
         if not isinstance(outcome, dict):
