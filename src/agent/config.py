@@ -26,6 +26,11 @@ def project_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+#: words that mean "send no effort field at all" (the /think off tier).  They are
+#: accepted case-insensitively from .env too, and normalise to "" -- so the field is
+#: omitted from the request instead of being sent empty.
+EFFORT_OFF_WORDS = frozenset({"", "off", "none", "no", "0", "不思考", "关闭", "default", "clear"})
+
 #: keys from .env that third-party libraries read straight out of the environment
 ENV_PASSTHROUGH_PREFIXES = ("HF_", "TRANSFORMERS_", "TORCH_", "SENTENCE_")
 ENV_PASSTHROUGH_EXACT = ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY")
@@ -95,7 +100,8 @@ class Settings(BaseSettings):
     # ``deepseek-flash`` reports ``input_modalities: ["text", "image"]``; the text model
     # accepts the same body but answers with empty content because it never sees the image.
     llm_vision_model: str = "deepseek-flash"
-    # Reasoning effort forwarded verbatim when non-empty ("" = leave the gateway default).
+    # Reasoning effort forwarded verbatim when non-empty ("" = leave the gateway default,
+    # i.e. the "不思考" / off tier: AGENT_LLM_EFFORT=off|none|no|0|不思考|关闭 also lands here).
     # Pass-through only: measured on this gateway the knob is accepted but its effect is
     # weak and noisy, so it is never used to decide anything here.
     llm_effort: Literal["", "low", "high", "max"] = ""
@@ -265,6 +271,15 @@ class Settings(BaseSettings):
     rpc_token: str = ""
 
     # ------------------------------------------------------------- validators
+    @field_validator("llm_effort", mode="before")
+    @classmethod
+    def _normalise_effort(cls, v: object) -> object:
+        """Accept the off aliases (case-insensitive) and turn them into ""."""
+        if not isinstance(v, str):
+            return v
+        word = v.strip().lower()
+        return "" if word in EFFORT_OFF_WORDS else word
+
     @field_validator("embedding_dim")
     @classmethod
     def _fixed_dim(cls, v: int) -> int:

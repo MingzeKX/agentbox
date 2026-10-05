@@ -80,7 +80,13 @@ def test_model_and_think_completion_from_the_known_lists():
     ]
     assert complete("/model deepseek-v", models=["deepseek-flash", "deepseek-v4-pro"]) == ["/model deepseek-v4-pro"]
     assert complete("/model nomatch", models=["deepseek-flash", "deepseek-v4-pro"]) == []
-    assert complete("/think ") == ["/think low", "/think high", "/think max", "/think default"]
+    assert complete("/think ") == [
+        "/think low",
+        "/think high",
+        "/think max",
+        "/think off",
+        "/think default",
+    ]
     assert complete("/think m") == ["/think max"]
 
 

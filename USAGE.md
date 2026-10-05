@@ -136,7 +136,7 @@ powershell -ExecutionPolicy Bypass -File .\deploy\windows\stop-agent.ps1
 | `/more` | 重看最近一次工具结果的**完整**输出 | `/more`、`/more answer`、`/more 2` |
 | `/tools` | 注册表工具的列表 / 退休 / 删除（不写 `.env`） | `/tools`、`/tools retire my_tool` |
 | `/model` | 看/切回答模型（**只有 `deepseek-flash` 能看图**） | `/model deepseek-flash` |
-| `/think` | 思考强度 `low` / `high` / `max`（**该网关效果不稳定**） | `/think high`、`/think default` |
+| `/think` | 思考强度 `low` / `high` / `max` / `off`（不思考，别名 `none`/`no`/`0`/`不思考`/`关闭`/`default`；**该网关效果不稳定**） | `/think high`、`/think off`、`/think 不思考` |
 | `/image` | 把本地图片附在下一条消息上（最多 4 张，自动切视觉模型） | `/image a.png 这是什么颜色？` |
 | `/voice` | 把本地录音转文字，并作为下一条消息发给 agent | `/voice C:\tmp\ask.wav` |
 | `/voice-mode` | 实时语音：`on` / `hands-free` / `off` / `status` | `/voice-mode on` |
@@ -216,9 +216,12 @@ AGENT_CUSTOM_PROMPT_FILE=/opt/agentbox/custom-prompt.md
   **带图的那一轮会自动切到视觉模型 `deepseek-flash`**；纯文字仍用 `/model` 选的模型。
 * **模型**：`/model` 看当前模型和可选列表，`/model deepseek-flash` 切换。
   只有 `deepseek-flash` 能看图；模型名不在列表里会被拒绝（免得切到不存在的模型）。
-* **思考强度**：`/think low|high|max`，`/think default` 清空。
+* **思考强度**：`/think low|high|max`，`/think off`（别名 `none`/`no`/`0`/`不思考`/`关闭`，也可写作
+  `.env` 里的 `AGENT_LLM_EFFORT=off`）表示**不思考**：请求体里完全不发送 `effort` 字段（不传 `""`、
+  不传 `null`、也不传空的 `thinking` 对象），这是目前最快的档位。
   **⚠️ 写明：`effort` 在当前网关上效果不稳定** —— 实测思考 token 中位数 low ≈ 104 /
   high ≈ 156 / max ≈ 124，波动比档位差别还大，传无效值网关也照收。
+  所以 `off` 只是**尽力而为**：它只保证把参数从请求里去掉，模型仍可能自行推理。
   请当成实验开关，不要指望"档位越高越好"。见 `RELEASE-v1.md` §4。
 
 ---

@@ -141,25 +141,35 @@ async def test_a_model_that_already_accepts_images_is_not_switched(monkeypatch):
 
 # ------------------------------------------------------------------------ effort
 
+#: every spelling of the "不思考" tier that must end up as "no effort field at all"
+EFFORT_OFF_WORDS = ("off", "OFF", "none", "no", "0", "不思考", "关闭", "default", "clear", "")
+
 
 @pytest.mark.asyncio
-async def test_effort_is_absent_when_not_configured(monkeypatch):
-    monkeypatch.setattr(settings, "llm_effort", "")
+@pytest.mark.parametrize("word", EFFORT_OFF_WORDS)
+async def test_off_sends_no_effort_or_thinking_key_at_all(monkeypatch, word):
+    """``off`` (and every alias) must leave the built payload without any effort field."""
+    monkeypatch.setattr(settings, "llm_effort", word)  # the .env validator normalises it
+    assert settings.llm_effort == "", "an off alias must normalise to the empty string"
     recorder = _Recorder()
     recorder.patch(monkeypatch)
 
     await _client().chat([{"role": "user", "content": "hello"}])
-    assert "effort" not in recorder.payload
+    payload = recorder.payload
+    assert "effort" not in payload
+    assert "thinking" not in payload, "no placeholder object may be sent either"
+    assert "effort" not in json.dumps(payload, ensure_ascii=False), "not even as null or ''"
 
 
 @pytest.mark.asyncio
-async def test_effort_is_passed_through_verbatim_when_configured(monkeypatch):
-    monkeypatch.setattr(settings, "llm_effort", "max")
+@pytest.mark.parametrize("level", ["low", "high", "max"])
+async def test_effort_is_passed_through_verbatim_when_configured(monkeypatch, level):
+    monkeypatch.setattr(settings, "llm_effort", level)
     recorder = _Recorder()
     recorder.patch(monkeypatch)
 
     await _client().chat([{"role": "user", "content": "hello"}])
-    assert recorder.payload["effort"] == "max"
+    assert recorder.payload["effort"] == level
 
 
 # ------------------------------------------------------------------ refusal paths

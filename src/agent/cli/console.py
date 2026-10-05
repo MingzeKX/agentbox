@@ -44,7 +44,7 @@ from agent.cli.voice import (
     sounddevice_available,
     transcribe,
 )
-from agent.config import project_root, settings
+from agent.config import EFFORT_OFF_WORDS, project_root, settings
 
 #: every console command, in the order the help prints them
 COMMANDS: tuple[str, ...] = (
@@ -465,8 +465,11 @@ print("@@PIP-LIST@@" + json.dumps({"packages": packages, "total_bytes": total, "
 
 #: the thinking-effort levels the gateway accepts; the order is the help order
 EFFORT_LEVELS: tuple[str, ...] = ("low", "high", "max")
-#: synonyms for "send no effort field at all"
-EFFORT_OFF: tuple[str, ...] = ("default", "off", "none", "clear", "")
+#: synonyms for the "不思考" tier: send no effort field at all.  Membership only -- the
+#: canonical spelling is off -- and the set is shared with the .env validator in config.
+EFFORT_OFF: frozenset[str] = EFFORT_OFF_WORDS
+#: how the off tier is spelled out in /think, /help and error messages
+EFFORT_OFF_LABEL = "off=不思考（别名：none、no、0、关闭、default、clear）"
 
 #: what /image asks when the command carried no question of its own
 DEFAULT_IMAGE_QUESTION = "请描述这张图里有什么。"
@@ -682,13 +685,14 @@ AGENT_VOICE_TTS；这两项不会写进 VM 的 .env（服务端没有喇叭，�
 模型名不在列表里会被拒绝，避免把自己切到一个不存在的模型上。""",
     "think": """[cyan]/think[/cyan]                         显示当前思考强度（effort）
 [cyan]/think low|high|max[/cyan]            设置思考强度
-[cyan]/think default[/cyan]                 清空：不发送 effort 字段
-                                 （别名：off、none、clear）
+[cyan]/think off[/cyan]                     不思考：完全不发送 effort 参数（最快）
+                                 （别名：none、no、0、不思考、关闭、default、clear）
 
 [red]注意：在当前网关上这个参数的效果不稳定。[/red]实测思考 token 的
 中位数 low ≈ 104、high ≈ 156、max ≈ 124，波动比档位差别还大，
 传无效值网关也照收。所以请把它当成实验开关，不要期待
-「提高档位就一定更好」。留空（default）即沿用网关默认。""",
+「提高档位就一定更好」。off（不思考）只是把参数从请求体里去掉，
+是尽力而为：不再发 effort，但模型仍可能自行推理。""",
     "clear": """[cyan]/clear[/cyan] [dim]（别名 /cls）[/dim]       清屏：清空这个终端，不改变当前会话
                                  （要开新会话用 /new）""",
     "cls": "参见 [cyan]/help clear[/cyan]。",
@@ -725,7 +729,7 @@ HELP = """
 [cyan]/perm[/cyan]      权限档位：safe | trusted | unrestricted       [dim](/help perm)[/dim]
 [cyan]/persona[/cyan]   回答风格；[bold]/persona off 取消角色扮演[/bold]     [dim](/help persona)[/dim]
 [cyan]/model[/cyan]     回答模型；[bold]deepseek-flash 能看图[/bold]          [dim](/help model)[/dim]
-[cyan]/think[/cyan]     思考强度 low | high | max（效果不稳定）      [dim](/help think)[/dim]
+[cyan]/think[/cyan]     思考强度 low | high | max | off=不思考（效果不稳定）   [dim](/help think)[/dim]
 [cyan]/image[/cyan]     把本地图片附在下一条消息上（最多 4 张）       [dim](/help image)[/dim]
 [cyan]/log[/cyan]       工具日志：ide | plain | json，长输出折叠         [dim](/help log)[/dim]
 [cyan]/more[/cyan]      重新显示最近一次工具结果（或回答）的完整输出       [dim](/help more)[/dim]
@@ -791,7 +795,7 @@ def complete(text: str, personas: list[str] | None = None, models: list[str] | N
             options = list(models)
         return [f"/{command} {name}" for name in options if name.startswith(rest)]
     if command == "think":
-        options: list[str] = [*EFFORT_LEVELS, "default"]
+        options: list[str] = [*EFFORT_LEVELS, "off", "default"]
         return [f"/{command} {name}" for name in options if name.startswith(rest)]
     options = SUBCOMMANDS.get(command, ())
     if command == "net" and rest:
@@ -1241,19 +1245,28 @@ class SlashConsole:
                 self.console.print("[yellow]无法连接 AI 服务，无法读取思考强度[/yellow]")
                 return
             effort = info.get("effort") or ""
-            self.console.print(f"[dim]思考强度：{effort or '（空 = 网关默认）'}[/dim]")
-            self.console.print(f"[dim]可选：{' | '.join(EFFORT_LEVELS)} | default（清空）[/dim]")
+            self.console.print(f"[dim]思考强度：{effort or '（空 = 不思考 / 网关默认）'}[/dim]")
+            self.console.print(f"[dim]可选：{' | '.join(EFFORT_LEVELS)} | {EFFORT_OFF_LABEL}[/dim]")
+            self.console.print(
+                "[dim]off（不思考）：请求体里完全不发送 effort，最快；但模型仍可能自行推理。[/dim]"
+            )
             self.console.print("[dim]该参数在当前网关效果不稳定，仅供参考。[/dim]")
             return
         wanted = args[0].strip().lower()
         value = "" if wanted in EFFORT_OFF else wanted
         if value and value not in EFFORT_LEVELS:
-            raise RuntimeError(f"未知强度 {args[0]!r} — 可用：{' | '.join(EFFORT_LEVELS)} | default（清空）")
+            raise RuntimeError(
+                f"未知强度 {args[0]!r} — 可用：{' | '.join(EFFORT_LEVELS)} | {EFFORT_OFF_LABEL}"
+            )
         effective, applied = self._apply_mutable({"llm_effort": value})
-        shown = effective.get("llm_effort") or "（空 = 网关默认）"
+        shown = effective.get("llm_effort") or "（空 = 不思考 / 网关默认）"
         self.console.print(f"[dim]思考强度：{shown}[/dim]")
         self._note(applied)
         if applied:
+            if not value:
+                self.console.print(
+                    "[dim]  已不发送 effort 参数（尽力而为：模型仍可能自行推理）。[/dim]"
+                )
             self.console.print("[dim]  该参数在当前网关效果不稳定，仅供参考。[/dim]")
 
     # ---------------------------------------------------------------------- image

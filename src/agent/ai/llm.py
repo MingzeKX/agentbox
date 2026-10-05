@@ -18,7 +18,7 @@ from typing import Any
 import httpx
 
 from agent.ai.history import GATEWAY_BODY_MAX_CHARS, sanitize_history
-from agent.config import settings
+from agent.config import EFFORT_OFF_WORDS, settings
 
 log = logging.getLogger(__name__)
 
@@ -258,8 +258,11 @@ class LLMClient:
         # Pass-through only.  Measured on this gateway: a bogus value is accepted, and a
         # 3-run reasoning-token average gave low 104 / high 156 / max 124 -- i.e. the
         # knob's effect is not reliably measurable here.  Never branch on it locally.
-        if settings.llm_effort:
-            payload["effort"] = settings.llm_effort
+        # The "不思考" (off) tier means: no field at all -- config normalises the aliases,
+        # and this guard keeps an empty/whitespace value from ever reaching the body.
+        effort = str(settings.llm_effort or "").strip().lower()
+        if effort and effort not in EFFORT_OFF_WORDS:
+            payload["effort"] = effort
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"

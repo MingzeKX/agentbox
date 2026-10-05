@@ -634,6 +634,9 @@ def test_think_shows_the_current_effort(shell, monkeypatch):
     text = output(console)
     assert "思考强度：high" in text
     assert "不稳定" in text
+    # the listing must advertise the new "不思考" tier and its aliases
+    for word in ("low", "high", "max", "off", "不思考", "none", "关闭"):
+        assert word in text
     assert sh.calls == [] and sh.persisted == []
 
 
@@ -657,7 +660,7 @@ def test_think_sets_each_level_and_persists(shell, monkeypatch, level):
     assert "该参数在当前网关效果不稳定" in text, "the success note must stay honest"
 
 
-@pytest.mark.parametrize("word", ["default", "off", "none", "clear"])
+@pytest.mark.parametrize("word", ["default", "off", "OFF", "none", "no", "0", "不思考", "关闭", "clear"])
 def test_think_can_be_cleared(shell, monkeypatch, word):
     sh, _, _ = shell
     monkeypatch.setattr("httpx.get", lambda *a, **k: fake_llm())
