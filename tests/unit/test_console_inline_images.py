@@ -23,6 +23,13 @@ from agent.cli.console import (
     scan_image_paths,
 )
 
+try:  # Pillow is optional on the host, like in the painter itself
+    from PIL import Image as _PILImage
+except Exception:  # noqa: BLE001
+    _PILImage = None
+
+needs_pillow = pytest.mark.skipif(_PILImage is None, reason="Pillow is not installed on this host")
+
 
 class _FakeImage:
     """The little bit of the Pillow API the half-block painter uses."""
@@ -131,3 +138,39 @@ def test_inline_images_are_pulled_like_get_capped_deduped_and_degrade_without_pi
     monkeypatch.setitem(sys.modules, "PIL", module)
     assert render_image_blocks(console, tmp_path / "anything.png") is True
     assert "▀" in output(console)
+
+
+@needs_pillow
+def test_a_real_png_is_painted_and_a_pulled_name_resolves_under_var_pulled(tmp_path, monkeypatch):
+    """A real decode paints coloured half-blocks, and ``var\\pulled``'s own name still works.
+
+    The live bug: the operator names a pulled picture the way the console prints it
+    (``acg.jpg`` / ``图片: var\\pulled\\acg.jpg``), which is not a path relative to the chat's
+    working directory, so ``Image.open`` raised FileNotFoundError, the painter swallowed it and
+    every good image answered ``False`` with no blocks painted.
+    """
+    source = tmp_path / "acg.png"
+    _PILImage.new("RGB", (4, 2), (255, 0, 0)).save(source)
+
+    console = Console(width=40, record=True, force_terminal=False)
+    assert render_image_blocks(console, source) is True, "a decodable image must paint"
+
+    text = output(console)
+    assert "▀" in text, "the half-block painter must actually paint"
+    # 4x2 at 40 columns keeps its aspect ratio: width 40, so 40*2/4/2 = 10 half-block rows
+    assert len([line for line in text.splitlines() if line]) == 10, "one block row per two pixel rows"
+
+    # on a truecolor terminal the top (red) pixel really is the cell's foreground colour
+    truecolor = Console(width=40, record=True, force_terminal=False, color_system="truecolor")
+    assert render_image_blocks(truecolor, source) is True
+    assert "\x1b[38;2;255;0;0;" in truecolor.export_text(styles=True), "the pixel colours reach the terminal"
+
+    # the name the console prints back to the operator, with no directory, must also resolve
+    pulled = tmp_path / "var" / "pulled"  # GET_FALLBACK_ROOT under the (patched) project root
+    pulled.mkdir(parents=True)
+    (pulled / "named.png").write_bytes(source.read_bytes())
+    monkeypatch.setattr("agent.cli.console.project_root", lambda: tmp_path)
+
+    named = Console(width=40, record=True, force_terminal=False)
+    assert render_image_blocks(named, "named.png") is True, "a var\\pulled name is not relative to the cwd"
+    assert "▀" in output(named)

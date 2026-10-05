@@ -197,6 +197,21 @@ def scan_image_paths(text: str) -> list[str]:
     return found
 
 
+def _pulled_host_path(path: Path | str) -> Path:
+    """``path`` as it should be opened: the caller's path, else the same name in ``var\\pulled``.
+
+    Operators name a pulled picture by the name the console itself prints (``图片: var\\pulled\\a.png``,
+    or just ``a.png``), which is not relative to whatever working directory the chat runs in.  The
+    file is only looked up under ``GET_FALLBACK_ROOT`` when the given path does not resolve, so a
+    real relative path still wins.
+    """
+    given = Path(path)
+    if given.exists():
+        return given
+    candidate = project_root() / GET_FALLBACK_ROOT / given
+    return candidate if candidate.exists() else given
+
+
 def render_image_blocks(console: Console, path: Path | str, *, columns: int = INLINE_IMAGE_COLUMNS) -> bool:
     """Paint the image at ``path`` as coloured half-blocks; False when it cannot be shown.
 
@@ -204,6 +219,8 @@ def render_image_blocks(console: Console, path: Path | str, *, columns: int = IN
     lower one as its background, which is the one trick that shows a picture in a plain
     terminal without any terminal-specific protocol.  The image keeps its aspect ratio,
     scaled to the console width and never wider than ``columns``.
+
+    A name that is not a path is looked up in ``var\\pulled`` (:func:`_pulled_host_path`).
 
     Pillow is optional on the host and any failure (no Pillow, not an image, unreadable
     file) is a ``False`` and no exception: the caller still prints the path line, so the
@@ -214,7 +231,7 @@ def render_image_blocks(console: Console, path: Path | str, *, columns: int = IN
     except Exception:  # noqa: BLE001 - Pillow is optional on the host
         return False
     try:
-        with Image.open(path) as handle:
+        with Image.open(_pulled_host_path(path)) as handle:
             image = handle.convert("RGB")
             width = max(1, min(int(columns), int(getattr(console, "width", 0) or columns)))
             rows = max(1, round(width * image.size[1] / max(1, image.size[0]) / 2))
