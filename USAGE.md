@@ -98,6 +98,13 @@ powershell -ExecutionPolicy Bypass -File .\deploy\windows\stop-agent.ps1
 > 反过来的话 AI 服务的 `/health` 会同步去探测控制平面、白等一个超时，
 > 于是"第一步就卡住"。
 
+> **把平台 VM 里的服务开给宿主（默认关闭，只绑回环）**：在根目录 `.env` 里写
+> `AGENT_PLATFORM_PORTS=2121,30000-30010`（逗号分隔的单个端口或闭区间），重启平台 VM 后
+> 就能在宿主上按 `ftp://127.0.0.1:2121` 访问 VM 里的 FTP/HTTP/…；屏幕上会打印
+> `VM port -> host 127.0.0.1:port` 的对照表。写上绑定地址会被直接拒绝（要绑别处请自己改
+> `run-platform-vm.ps1`），**445 / 139 也会被拒绝**（Windows 宿主自己占着 SMB，请换宿主端口，
+> 例如 8445）。**沙箱 VM 的隔离没有变化 —— 这只影响平台 VM。**
+
 ---
 
 ## 4. 对话与全部控制台命令

@@ -170,6 +170,14 @@ class Settings(BaseSettings):
     sandbox_job_memory_bytes: int = 5_368_709_120
     sandbox_job_max_processes: int = 256
 
+    # ------------------------------------------------------------ platform VM
+    # Extra port forwards from the platform VM to this machine, applied by
+    # deploy/windows/run-platform-vm.ps1: comma separated single ports / inclusive
+    # ranges, e.g. "2121,30000-30010".  Loopback only (127.0.0.1) -- an explicit
+    # bind address is refused; 445/139 are refused too (this host owns SMB).
+    # Empty (the default) = off: no extra forward.
+    platform_ports: str = ""
+
     # ------------------------------------------------------- execution limits
     exec_default_timeout_s: float = 120.0
     exec_max_timeout_s: float = 300.0
