@@ -202,6 +202,18 @@ def test_system_prompt_pins_authorization_and_honesty_after_the_persona():
     assert prompt.index("主人自己交来的凭据 + 明确指令 = 授权本身") > persona_at
     assert prompt.index("严禁编造工具返回值") > persona_at
 
+    # the delivery routes are real, and they must be named after the persona too:
+    # fs.pull to var\pulled\, the inline image path, /get, and the plain fact that
+    # the sandbox is online. Without these the agent denies having a channel at all.
+    assert "fs.pull" in prompt
+    assert "var\\pulled\\" in prompt
+    assert "/workspace/chart.png" in prompt
+    assert "/get <沙箱路径>" in prompt
+    assert "默认是联网的" in prompt
+    assert "/net allow <域名>" in prompt
+    for rule in ("`fs.pull` 推到主机的", "默认是联网的"):
+        assert prompt.index(rule) > persona_at
+
 
 @pytest.mark.parametrize("name", personas.names())
 def test_no_persona_can_override_or_precede_the_operating_rules(name):
@@ -214,9 +226,25 @@ def test_no_persona_can_override_or_precede_the_operating_rules(name):
 
     assert f"# Persona: {persona.name}" in prompt
     persona_at = prompt.index(f"# Persona: {persona.name}")
-    for rule in ("主人自己交来的凭据 + 明确指令 = 授权本身", "严禁编造工具返回值"):
+    for rule in (
+        "主人自己交来的凭据 + 明确指令 = 授权本身",
+        "严禁编造工具返回值",
+        "`fs.pull` 推到主机的",
+        "默认是联网的",
+    ):
         assert rule in prompt, f"{name} dropped {rule!r}"
         assert prompt.index(rule) > persona_at, f"{name} outranks {rule!r}"
     # the base contract is still there, and so is the sandbox reality
     assert "You are an autonomous engineering agent." in prompt
     assert "/workspace" in prompt
+
+
+def test_fs_pull_is_in_the_seeded_core_tools():
+    """The prompt tells the model to use fs.pull, so the seed must actually ship it."""
+    from agent.ai.pull import PULL_HANDLERS
+    from agent.registry.seed import CORE_TOOLS
+
+    spec = next(item for item in CORE_TOOLS if item["name"] == "fs.pull")
+    assert spec["executor"] == "host_native"
+    assert "fs.pull" in PULL_HANDLERS
+    assert "var\\pulled" in spec["description"]
