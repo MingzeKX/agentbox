@@ -88,12 +88,17 @@ def load(name: str | None = None) -> Persona:
     return Persona(name=DEFAULT_PERSONA, text=text, source="default")
 
 
-def build_system_prompt(base: str, persona: Persona, facts: list[str], operating: str = "") -> str:
-    """Assemble base prompt + persona + the operating/safety tail + runtime facts.
+def build_system_prompt(
+    base: str, persona: Persona, facts: list[str], operating: str = "", custom: str = ""
+) -> str:
+    """Assemble base prompt + persona + operating tail + custom layer + runtime facts.
 
-    Order matters: the persona goes after the base prompt's contract, and the
-    operating tail (authorization, honesty, how to name a real limit) goes *after*
-    the persona, so no persona can restyle it away.  Nothing in the base prompt is
+    Order matters: the persona goes after the base prompt's contract, the operating
+    tail (authorization, honesty, how to name a real limit) goes *after* the persona,
+    and the operator's own ``custom`` text is the strongest *text* layer, so it sits
+    after both.  Text is still only text: the code-level policy (tool tiers, the
+    permission ceiling, the firewall, the sandbox) outranks every layer here, and the
+    model provider's own policy outranks all of them.  Nothing in the base prompt is
     ever removed.
     """
     parts = [base.rstrip()]
@@ -101,6 +106,8 @@ def build_system_prompt(base: str, persona: Persona, facts: list[str], operating
         parts.append(f"# Persona: {persona.name}\n\n{persona.text}")
     if operating.strip():
         parts.append(operating.strip())
+    if custom.strip():
+        parts.append(f"# Custom (operator)\n\n{custom.strip()}")
     if facts:
         parts.append("# Runtime\n\n" + "\n".join(f"* {line}" for line in facts))
     return "\n\n".join(parts) + "\n"

@@ -413,6 +413,12 @@ curl.exe -s -o NUL -w "%{http_code}`n" http://127.0.0.1:8090/health
 
 也就是说：**会话内容/提示词改不了上面这些开关的判定**——它们读的是 `.env`/运行时配置，在服务端生效。
 
+> **操作员想加自己的提示词，请写文件，不要手改 `.py`**（手改 `src/agent/ai/*.py` 出错会让 AI 服务起不来）：
+> 在 VM 里 `sudo tee /opt/agentbox/custom-prompt.md`（仓库外，`push-repo-to-vm.ps1` 不会覆盖），并在 `.env` 里加
+> `AGENT_CUSTOM_PROMPT_FILE=/opt/agentbox/custom-prompt.md`。**每次请求重新读**（改完下一轮生效，不用重启），
+> 位置在 persona 与内置规则**之后**（`base → persona → operating → custom → runtime`），但同样改不了上面这些服务端开关；
+> 文件缺失/空/非 UTF-8/过大只会被忽略并记一条日志，服务不受影响（细节见 [`USAGE.md`](USAGE.md) §4 末）。
+
 ---
 
 ## 9. 与其它文档的关系

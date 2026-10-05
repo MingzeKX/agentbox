@@ -9,6 +9,7 @@ import pytest
 from agent.ai import personas
 from agent.ai.agent_loop import AgentLoop, load_system_prompt
 from agent.ai.llm import LLMError, LLMResult, LLMToolCall
+from agent.config import settings
 from agent.registry import repository as repo
 
 
@@ -237,6 +238,41 @@ def test_no_persona_can_override_or_precede_the_operating_rules(name):
     # the base contract is still there, and so is the sandbox reality
     assert "You are an autonomous engineering agent." in prompt
     assert "/workspace" in prompt
+
+
+def test_custom_prompt_lands_after_persona_and_operating(tmp_path, monkeypatch):
+    """The operator's own file is the strongest *text* layer: their words come after
+    the persona and after the operating tail, and runtime facts stay last."""
+    custom = tmp_path / "custom.md"
+    marker = "主人自己的话：每次回答都以 CUSTOM-MARKER 结尾。"
+    custom.write_text(marker + "\n", encoding="utf-8")
+    monkeypatch.setattr(settings, "custom_prompt_file", str(custom))
+
+    prompt = load_system_prompt("s-custom")
+
+    assert marker in prompt
+    custom_at = prompt.index(marker)
+    assert custom_at > prompt.index("# Persona: ")
+    assert custom_at > prompt.index("严禁编造工具返回值")  # after the whole operating tail
+    assert prompt.index("# Runtime") > custom_at
+
+
+def test_custom_prompt_is_a_silent_no_op_when_missing_or_empty(tmp_path, monkeypatch):
+    """A broken slot degrades to *no* custom layer: never an exception, and the rest
+    of the assembled prompt is byte-for-byte what it was."""
+    monkeypatch.setattr(settings, "custom_prompt_file", str(tmp_path / "missing.md"))
+    baseline = load_system_prompt("s-custom")  # missing file: no raise, no custom layer
+    assert "# Custom (operator)" not in baseline
+
+    empty = tmp_path / "empty.md"
+    empty.write_text("\n  \n", encoding="utf-8")
+    monkeypatch.setattr(settings, "custom_prompt_file", str(empty))
+    assert load_system_prompt("s-custom") == baseline
+
+    binary = tmp_path / "binary.md"
+    binary.write_bytes(b"\xff\xfe\x00 not utf-8")
+    monkeypatch.setattr(settings, "custom_prompt_file", str(binary))
+    assert load_system_prompt("s-custom") == baseline
 
 
 def test_fs_pull_is_in_the_seeded_core_tools():

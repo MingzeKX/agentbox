@@ -159,6 +159,32 @@ powershell -ExecutionPolicy Bypass -File .\deploy\windows\stop-agent.ps1
 > 自定义 persona：把 `<name>.md` 放进仓库根的 `personas\`（同名会覆盖内置）。
 > 人格名只允许 `[a-z0-9_-]{1,32}`，`..\..\etc\passwd` 这种会被拒并降级。
 
+### 自定义提示词：`custom.md`（写文件，别手改 `.py`）
+
+想让 agent 长期按你自己的话办事，只需要一个**纯文本文件**——**不需要**（也不要）手改
+`src/agent/ai/*.py`：改坏了 AI 服务会直接起不来。
+
+```bash
+# 在 VM 里建文件（放在仓库外：push-repo-to-vm.ps1 永远不会覆盖它）
+sudo tee /opt/agentbox/custom-prompt.md >/dev/null <<'EOF'
+回答一律用中文；先给结论，再给依据。
+EOF
+# 在仓库根 .env（AI 服务在 VM 里读的是 /opt/agentbox/app/.env）加一行：
+AGENT_CUSTOM_PROMPT_FILE=/opt/agentbox/custom-prompt.md
+```
+
+* 没设 `AGENT_CUSTOM_PROMPT_FILE` 时默认读仓库根的 `prompts\custom.md`
+  （起点模板：`prompts\custom.md.example`）。注意 `push-repo-to-vm.ps1` **不推** `prompts\`，
+  所以 VM 上请用上面的绝对路径。
+* **每次请求都重新读**：改完文件下一轮就生效，**不用重启**服务。
+* 位置：`base → persona → operating → custom → runtime`，也就是**文本层里最靠后的一层**
+  （你的话强于 persona 和内置规则）。但文本终究只是文本：工具档位、权限分级、联网白名单、
+  沙箱隔离这些**代码层面的策略它改不了**，模型提供方的策略也高于所有文本层。
+* 文件缺失 / 空 / 不是 UTF-8 / 读不了 / 超过 20 000 字符：只记一条日志，**自动忽略这一层**，
+  其余提示词照常，服务不会因此报错。
+* 运行时改路径：`/config custom_prompt_file /opt/agentbox/custom-prompt.md`（立即生效）；
+  要重启后仍生效，照上面把它写进 `.env`（这个新键不在控制台自动写回的名单里）。
+
 ---
 
 ## 5. 语音

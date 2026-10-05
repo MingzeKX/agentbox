@@ -236,6 +236,13 @@ class Settings(BaseSettings):
     persona: str = "engineer"
     # extra directory of operator-authored personas (defaults to <repo>/personas)
     persona_dir: str = ""
+    # The operator's own prompt text, as a *file* rather than hand-edited Python: an
+    # absolute path that may live outside the repo (e.g. /opt/agentbox/custom-prompt.md,
+    # the durable slot deploy/windows/push-repo-to-vm.ps1 never touches).  It is read
+    # again on every request, so an edit takes effect on the next turn with no restart,
+    # and a missing/unreadable/oversized file only costs this one layer.
+    # Empty = <repo>/prompts/custom.md if that file exists, else no custom layer.
+    custom_prompt_file: str = ""
 
     net_enabled: bool = False
     # comma separated hosts; "*.example.com" wildcards; a bare "*" allows everything

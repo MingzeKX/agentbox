@@ -16,7 +16,7 @@ from agent.ai import personas
 from agent.ai.history import HISTORY_MESSAGE_MAX_CHARS, drop_leading_orphans, for_history, truncate_for_history
 from agent.ai.llm import LLMClient, LLMError
 from agent.ai.metacalls import DispatchOutcome, MetaTools
-from agent.config import settings
+from agent.config import project_root, settings
 from agent.registry import repository as repo
 
 log = logging.getLogger(__name__)
@@ -27,9 +27,18 @@ PROMPT_PATH = Path(__file__).parent / "prompts" / "system.md"
 #: appended *after* the persona in :func:`load_system_prompt`, so a persona can
 #: restyle the answer but never weaken these rules.
 OPERATING_PATH = Path(__file__).parent / "prompts" / "operating.md"
+#: The operator's own prompt slot (convenience default; the durable slot is
+#: ``AGENT_CUSTOM_PROMPT_FILE``, which may live outside the repo).  Their own words
+#: are the strongest *text* layer, so it is appended after the operating tail; the
+#: provider's policy still outranks every text layer.
+CUSTOM_PROMPT_PATH = project_root() / "prompts" / "custom.md"
+MAX_CUSTOM_PROMPT_CHARS = 20_000
 MAX_TOOL_CALLS_PER_STEP = 8
 
 EventSink = Callable[[str, dict[str, Any]], None]
+
+#: last custom-prompt problem already logged, so a broken file logs once, not per request
+_custom_problem_logged: str | None = None
 
 
 @dataclass
@@ -66,21 +75,77 @@ class TurnResult:
     tokens_estimate: int = 0
 
 
+def _report_custom_problem(problem: str) -> None:
+    """Log a broken custom-prompt file once, not on every request."""
+    global _custom_problem_logged
+    if problem != _custom_problem_logged:
+        _custom_problem_logged = problem
+        log.warning("custom prompt ignored: %s", problem)
+
+
+def custom_prompt() -> str:
+    """The operator's own prompt text for this request, or ``""``.
+
+    Resolution, first existing non-empty file wins: ``settings.custom_prompt_file``
+    (an absolute path from ``.env``; it may live outside the repo -- e.g.
+    ``/opt/agentbox/custom-prompt.md``, the durable slot that
+    ``push-repo-to-vm.ps1`` never touches), then ``<repo>/prompts/custom.md``.
+
+    This is the operator's slot, so it may never break the service: the file is read
+    again on every request (an edit takes effect on the next turn, no restart), and
+    any problem -- missing, empty, unreadable, not UTF-8, absurdly large -- is logged
+    once and the request simply carries no custom layer.
+    """
+    candidates: list[tuple[Path, bool]] = []
+    configured = settings.custom_prompt_file.strip()
+    if configured:  # explicit slot: a typo is worth one warning
+        candidates.append((Path(configured).expanduser(), True))
+    candidates.append((CUSTOM_PROMPT_PATH, False))
+
+    for path, explicit in candidates:
+        try:
+            if not path.is_file():
+                if explicit:
+                    _report_custom_problem(f"{path}: not a file")
+                continue
+            with path.open(encoding="utf-8") as handle:
+                # read one char past the cap: bounds memory *and* detects truncation
+                text = handle.read(MAX_CUSTOM_PROMPT_CHARS + 1)
+        except Exception as exc:  # noqa: BLE001 - the operator's slot must never raise
+            _report_custom_problem(f"{path}: {type(exc).__name__}: {exc}")
+            continue
+        text = text.strip()
+        if not text:
+            if explicit:
+                _report_custom_problem(f"{path}: empty")
+            continue
+        if len(text) > MAX_CUSTOM_PROMPT_CHARS:
+            _report_custom_problem(f"{path}: truncated to {MAX_CUSTOM_PROMPT_CHARS} chars")
+            text = text[:MAX_CUSTOM_PROMPT_CHARS]
+        return text
+    return ""
+
+
 def load_system_prompt(session_id: str, extra: str | None = None, persona: str | None = None) -> str:
-    """Base prompt + the configured persona + the operating tail + runtime facts.
+    """Base prompt + persona + operating tail + the operator's custom file + runtime facts.
 
     The persona is chosen by the operator (config or console), never by the model,
     and the operating section (``prompts/operating.md``: the operator's own
     credentials are the authorization, never fake a result, name the real limit) is
     appended *after* the persona, so a persona can restyle the answer but cannot
-    remove or weaken the safety and honesty rules.
+    remove or weaken the safety and honesty rules.  The operator's own text
+    (:func:`custom_prompt`, re-read per request) comes last of the text layers, so
+    their words outrank persona and built-ins -- but only as text: code-level policy
+    still decides, and the provider's policy outranks every layer here.
     """
     base = PROMPT_PATH.read_text(encoding="utf-8")
     operating = OPERATING_PATH.read_text(encoding="utf-8")
     facts = [f"Current session id: {session_id}.", "Your sandbox workspace persists for this session."]
     if extra:
         facts.append(extra)
-    return personas.build_system_prompt(base, personas.load(persona), facts, operating=operating)
+    return personas.build_system_prompt(
+        base, personas.load(persona), facts, operating=operating, custom=custom_prompt()
+    )
 
 
 def _preview(value: Any, limit: int = 400) -> str:
