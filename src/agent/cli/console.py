@@ -876,6 +876,14 @@ class SlashConsole:
             # /model and /think: also runtime changes, so they persist like the rest
             "AGENT_LLM_MODEL": values.get("llm_model"),
             "AGENT_LLM_EFFORT": values.get("llm_effort") or "",
+            # the operator's own prompt file: strongest text layer, hot-reloaded, may live
+            # outside the repo so a repo push never overwrites it
+            "AGENT_CUSTOM_PROMPT_FILE": values.get("custom_prompt_file") or "",
+            # self-written tool imports: without these three the profile silently reverts
+            # to strict after a restart
+            "AGENT_TOOL_IMPORT_PROFILE": values.get("tool_import_profile") or "strict",
+            "AGENT_TOOL_EXTRA_MODULES": values.get("tool_extra_modules") or "",
+            "AGENT_TOOL_ALLOW_OPEN": "1" if values.get("tool_allow_open") else "0",
         }
 
     def _persist(self, keys: dict[str, Any]) -> None:
