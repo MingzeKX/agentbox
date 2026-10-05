@@ -9,6 +9,7 @@ the same way: no test may reach the network or the VM.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 
 import pytest
@@ -948,16 +949,19 @@ def test_get_hands_the_bytes_to_the_control_plane_and_never_admin_config(shell, 
     def fake_rpc(method, params=None, timeout=120.0):  # noqa: ANN001
         calls.append((method, dict(params or {}), timeout))
         if method == "sandbox.invoke":
+            # exactly what ``_control_rpc`` hands back for a successful guest ``fs.read``:
+            # the SandboxInvokeResult, whose "result" is the handler payload (no "ok").
             return {
                 "ok": True,
                 "result": {
-                    "ok": True,
-                    "result": {
-                        "path": "/workspace/plot.png",
-                        "size": len(payload),
-                        "data_b64": base64.b64encode(payload).decode("ascii"),
-                    },
+                    "path": "/workspace/plot.png",
+                    "size": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "truncated": False,
+                    "data_b64": base64.b64encode(payload).decode("ascii"),
                 },
+                "duration_ms": 7,
+                "vm_id": "vm-test",
             }
         return {"ok": True, "path": str(tmp_path / "pulled" / "plot.png"), "bytes": len(payload)}
 
@@ -993,5 +997,50 @@ def test_get_refuses_a_path_outside_the_workspace_and_a_dest_that_escapes(shell,
     assert sh.handle("/get /workspace/../../etc/passwd") is True
     assert sh.handle("/get /workspace/a.png ../escape.png") is True
     assert calls == [], "a refused /get must not reach the control plane"
-    assert "已取到" not in output(console)
+    assert "已保存" not in output(console)
+
+
+def test_get_accepts_the_live_fs_read_payload_shape(shell, tmp_path, monkeypatch):
+    """Regression (live: ``/get /workspace/acg.jpg`` said 沙箱读不到).
+
+    The gateway's ``fs.read`` answers with ``path``/``size``/``sha256``/``truncated``/
+    ``data_b64`` and *no* top-level ``ok``.  The console unwrapped one level too many, so
+    that good payload was read as a failed invoke and no host file was ever written.
+    """
+    sh, console, state = shell
+    state.session_id = "s-test"
+    # a real JPEG header, truncated on purpose; the reported size/sha256 are the live ones
+    blob_b64 = "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0a"
+    payload = base64.b64decode(blob_b64)
+    calls: list[tuple[str, dict]] = []
+    opened: list[list[str]] = []
+
+    def fake_rpc(method, params=None, timeout=120.0):  # noqa: ANN001
+        calls.append((method, dict(params or {})))
+        if method == "sandbox.invoke":
+            return {
+                "ok": True,
+                "result": {
+                    "path": "/workspace/acg.jpg",
+                    "size": 232268,
+                    "sha256": "6c5ce158eb785a6484021bc6b4f8cae62f155225b5f3b130668580e95b497190",
+                    "truncated": False,
+                    "data_b64": blob_b64,
+                },
+                "duration_ms": 9,
+                "vm_id": "vm-test",
+            }
+        return {"ok": True, "path": str(tmp_path / "pulled" / "acg.jpg"), "bytes": len(payload)}
+
+    monkeypatch.setattr("agent.cli.main._control_rpc", fake_rpc)
+    monkeypatch.setattr("subprocess.run", lambda argv, **kw: opened.append(list(argv)))
+
+    assert sh.handle("/get /workspace/acg.jpg") is True
+
+    assert [method for method, _ in calls] == ["sandbox.invoke", "host.pull.write"]
+    assert base64.b64decode(calls[1][1]["data_b64"]) == payload, "the bytes must reach host.pull.write"
+    text = output(console)
+    assert "沙箱读不到" not in text, "a successful fs.read must not be reported as unreadable"
+    assert "已保存" in text and "acg.jpg" in text and hashlib.sha256(payload).hexdigest()[:16] in text
+    assert opened and "Start-Process" in opened[0]
 

@@ -1207,10 +1207,16 @@ class SlashConsole:
                 raise RuntimeError(
                     f"控制平面不可达（{exc}）—— 沙箱读取也要经过它；确认控制平面在跑"
                 ) from exc
-            outcome = (body or {}).get("result") or {}
+            # ``_control_rpc`` already stripped the JSON-RPC envelope, so ``body`` *is* the
+            # SandboxInvokeResult (``{"ok": ..., "result": {...}}``) and ``result`` is the
+            # guest handler's payload -- ``fs.read`` answers with size/sha256/data_b64 and
+            # no ``ok`` of its own.  Unwrapping twice made a good read look like a failure.
+            outcome = body if isinstance(body, dict) else {}
+            if "data_b64" in outcome and "ok" not in outcome:
+                outcome = {"ok": True, "result": outcome}
             if not outcome.get("ok"):
                 raise RuntimeError(f"沙箱读不到 {path}：{str(outcome.get('error') or outcome)[:300]}")
-            result = outcome.get("result") or {}
+            result = outcome.get("result") if isinstance(outcome.get("result"), dict) else {}
             size = int(result.get("size") or 0)
             chunk = base64.b64decode(str(result.get("data_b64") or ""))
             if not chunk:
@@ -1218,7 +1224,7 @@ class SlashConsole:
             chunks.append(chunk)
             digest.update(chunk)
             offset += len(chunk)
-            if offset >= size:
+            if result.get("truncated") is False or offset >= size:
                 break
         payload = b"".join(chunks)
 
@@ -1232,11 +1238,11 @@ class SlashConsole:
         host_path = str(written.get("path") or "")
         if not host_path:
             raise RuntimeError("控制面没有返回宿主机路径")
-        self.console.print(f"[green]已取到[/green] [bold]{host_path}[/bold]")
         self.console.print(
-            f"[dim]{_pip_bytes(len(payload))} · sha256 {digest.hexdigest()[:16]}… · "
-            f"落在仓库的 {GET_FALLBACK_ROOT} 下[/dim]"
+            f"[green]已保存[/green]: [bold]{host_path}[/bold] "
+            f"({_pip_bytes(len(payload))}, sha256 {digest.hexdigest()})"
         )
+        self.console.print(f"[dim]落在仓库的 {GET_FALLBACK_ROOT} 下[/dim]")
         if Path(host_path).suffix.lower() in GET_IMAGE_SUFFIXES:
             self._open_image(host_path)
 
