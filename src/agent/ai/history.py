@@ -170,6 +170,67 @@ def drop_leading_orphans(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
     return messages[start:]
 
 
+def _prune_unanswered(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Enforce the gateway's *ordering* rule on ``entries``.
+
+    A declaration is only valid when the ``tool`` messages that answer it follow the
+    assistant message **immediately**: the API rejects a request in which an assistant
+    message with ``tool_calls`` is not directly followed by one ``tool`` message per
+    declared id -- "insufficient tool messages following tool_calls message".  Matching the
+    ids anywhere in the window is not enough, and that is the hole this closes: on
+    2026-10-05 a tool that timed out after 60 s had its failure row written twelve rows
+    after the declaration that asked for it (two turns of one session interleaved, because
+    the streaming endpoint starts a task per request), behind a ``user`` message and five
+    more steps -- every id matched, the order was still fatal.
+
+    So the pairing is resolved positionally, in one forward pass: an assistant message
+    opens a group, the ``tool`` messages directly after it answer it, and anything else
+    closes the group.  Calls still unanswered when the group closes lose their entry in the
+    declaration (and the message itself if that leaves it empty); a ``tool`` message that
+    arrives outside its group is an orphan and goes.  Both sides of the pair always move
+    together, so no id is ever half-answered.
+    """
+    pruned: list[dict[str, Any]] = []
+    open_calls: dict[str, dict[str, Any]] = {}
+    answered: set[str] = set()
+
+    def close_group() -> None:
+        for call_id, entry in open_calls.items():
+            if call_id in answered:
+                continue
+            remaining = [call for call in entry.get("tool_calls", []) if call["id"] != call_id]
+            if remaining:
+                entry["tool_calls"] = remaining
+            else:
+                # no empty array either: the key is simply absent, like a plain message
+                entry.pop("tool_calls", None)
+        open_calls.clear()
+        answered.clear()
+
+    for entry in entries:
+        role = str(entry.get("role") or "")
+        if role == "tool":
+            call_id = str(entry.get("tool_call_id") or "")
+            if call_id in open_calls and call_id not in answered:
+                answered.add(call_id)
+                pruned.append(entry)
+            else:
+                log.debug("dropping orphaned tool message (tool_call_id=%s)", call_id or "<empty>")
+            continue
+        close_group()
+        pruned.append(entry)
+        if role == "assistant":
+            for call in entry.get("tool_calls") or []:
+                open_calls[call["id"]] = entry
+    close_group()
+
+    return [
+        entry
+        for entry in pruned
+        if entry["role"] != "assistant" or entry.get("tool_calls") or str(entry.get("content") or "").strip()
+    ]
+
+
 def sanitize_history(
     messages: list[dict[str, Any]],
     *,
@@ -181,10 +242,10 @@ def sanitize_history(
     Everything that makes a request body invalid or unbounded is dealt with here, so no
     caller has to remember to:
 
-    * orphaned ``tool`` messages are dropped -- their ``tool_call_id`` is not declared by
-      any assistant message in the window (the window boundary cut the pair in half);
-    * ``tool_calls`` that no ``tool`` message answers are dropped -- an interrupted step
-      must not leave a dangling declaration;
+    * every ``tool_calls``/``tool`` pair is resolved *positionally* by
+      :func:`_prune_unanswered` -- a declaration whose answers are missing, out of order or
+      cut off by the budget boundary loses those entries, and the orphaned ``tool``
+      messages go with them;
     * empty/whitespace messages are dropped;
     * ``image_url`` parts are dropped from every message except the last one, which is the
       turn being sent (history keeps only the placeholder text);
@@ -193,8 +254,6 @@ def sanitize_history(
     """
     system: dict[str, Any] = {}
     entries: list[dict[str, Any]] = []
-    owners: dict[str, dict[str, Any]] = {}
-    answered: set[str] = set()
     last_index = len(messages) - 1
 
     for index, message in enumerate(messages):
@@ -224,41 +283,21 @@ def sanitize_history(
             entry: dict[str, Any] = {"role": "assistant", "content": text}
             if calls:
                 entry["tool_calls"] = calls
-                for call in calls:
-                    owners[call["id"]] = entry
             entries.append(entry)
             continue
         if role == "tool":
-            call_id = str(message.get("tool_call_id") or "")
-            if call_id not in owners:
-                log.debug("dropping orphaned tool message (tool_call_id=%s)", call_id or "<empty>")
-                continue
-            answered.add(call_id)
             entries.append(
                 {
                     "role": "tool",
-                    "tool_call_id": call_id,
+                    "tool_call_id": str(message.get("tool_call_id") or ""),
                     "name": str(message.get("name") or ""),
                     "content": truncate_for_history(_text_of(message.get("content")), tool_max_chars),
                 }
             )
             continue
 
-    # an assistant message may only declare calls that something answers
-    for call_id, entry in owners.items():
-        if call_id in answered:
-            continue
-        remaining = [call for call in entry.get("tool_calls", []) if call["id"] != call_id]
-        if remaining:
-            entry["tool_calls"] = remaining
-        else:
-            # no empty array either: the key is simply absent, like a plain message
-            entry.pop("tool_calls", None)
-    entries = [
-        entry
-        for entry in entries
-        if entry["role"] != "assistant" or entry.get("tool_calls") or str(entry.get("content") or "").strip()
-    ]
+    # an assistant may only declare calls that the messages *directly after* it answer
+    entries = _prune_unanswered(entries)
 
     # budget: keep the newest that fit, oldest first when sent
     kept: list[dict[str, Any]] = []
@@ -270,6 +309,9 @@ def sanitize_history(
         kept.append(entry)
         total += size
     kept.reverse()
+    # the trim can cut a declaration off its answers (the boundary lands *inside* a group),
+    # so the ordering rule has to hold for what actually goes out, not just for what came in
+    kept = _prune_unanswered(kept)
 
     dropped = len(entries) - len(kept)
     if dropped and system:

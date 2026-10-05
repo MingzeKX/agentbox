@@ -455,3 +455,115 @@ async def test_a_crashed_tool_call_is_still_answered_so_history_stays_valid(fake
     }
     answered = {message["tool_call_id"] for message in second if message["role"] == "tool"}
     assert declared == answered == {"call_dead"}
+
+
+# ------------------------------------------------------------------ egress, live shapes
+
+
+def _call(call_id: str, name: str = "exec.run") -> dict[str, Any]:
+    return {"id": call_id, "type": "function", "function": {"name": name, "arguments": "{}"}}
+
+
+def _gateway_violations(messages: list[dict[str, Any]]) -> list[str]:
+    """Every way the gateway's own rule can be broken, as it words it.
+
+    "An assistant message with 'tool_calls' must be followed by tool messages responding to
+    each 'tool_call_id'": matching the ids *somewhere* in the window is not enough, the
+    ``tool`` messages have to come directly after the assistant message that declared them.
+    """
+    violations: list[str] = []
+    pending: list[str] = []
+    for message in messages:
+        role = message.get("role")
+        if role == "assistant":
+            if pending:
+                violations.append(f"unanswered tool_calls {pending} before another assistant message")
+            pending = [call["id"] for call in message.get("tool_calls") or []]
+        elif role == "tool":
+            call_id = str(message.get("tool_call_id") or "")
+            if call_id not in pending:
+                violations.append(f"tool message for an undeclared or out-of-order id {call_id!r}")
+            else:
+                pending.remove(call_id)
+        else:
+            if pending:
+                violations.append(f"unanswered tool_calls {pending} before a {role} message")
+            pending = []
+    if pending:
+        violations.append(f"unanswered tool_calls {pending} at the end of the request")
+    return violations
+
+
+def _live_interleaved_poison() -> list[dict[str, Any]]:
+    """Session ``s-f359a3532dab410f`` (2026-10-05), rows 871..884, verbatim but elided.
+
+    Two turns of one session ran at once (the streaming endpoint starts a task per request)
+    and a 60 s ``exec.run`` timeout wrote its failure row at **883** -- behind the operator's
+    next message (872) and five more steps.  Every id matched somewhere in the window, so
+    the old id-keyed sanitizer forwarded it all and the gateway answered HTTP 400
+    "insufficient tool messages following tool_calls message" on every later turn.
+    """
+    timeout = "call_00_pCTey4FzJyKa0evO1XVU7808"
+    return [
+        {"role": "user", "content": "https://www.yeqing.net/blog/acg-api/ 用这个api试试"},
+        {
+            "role": "assistant",
+            "content": "Lolicon API 通了（返回 200 + JSON），就用 Lolicon 下载一张。",
+            "tool_calls": [_call(timeout)],
+        },
+        {"role": "user", "content": "https://www.yeqing.net/blog/acg-api/ 用这个api试试"},
+        {"role": "assistant", "content": "主人，我去看看这个页面上的 API。", "tool_calls": [_call("call_00_MO1F")]},
+        {"role": "tool", "tool_call_id": "call_00_MO1F", "name": "call_tool", "content": '{"ok": true}'},
+        {"role": "assistant", "content": "页面拿到了（200，44660 字节）。", "tool_calls": [_call("call_00_GIml")]},
+        {"role": "tool", "tool_call_id": "call_00_GIml", "name": "call_tool", "content": '{"ok": true}'},
+        {
+            "role": "assistant",
+            "content": "下载成功，是合法 JPEG。确认一下文件，然后推给主人。",
+            "tool_calls": [_call("call_00_dQOP", "fs.stat"), _call("call_01_kRnc", "fs.pull")],
+        },
+        {"role": "tool", "tool_call_id": "call_00_dQOP", "name": "call_tool", "content": '{"ok": true}'},
+        # the stranded one: this is row 883, the failed (timed-out) call declared at row 871
+        {
+            "role": "tool",
+            "tool_call_id": timeout,
+            "name": "call_tool",
+            "content": '{"ok": false, "tool": "exec.run", "error": "exec.run did not answer within 60s '
+            'inside sandbox vm-bab2ed9d44", "error_code": "timeout", "duration_ms": 60001}',
+        },
+        {"role": "tool", "tool_call_id": "call_01_kRnc", "name": "call_tool", "content": '{"ok": false}'},
+    ]
+
+
+def test_a_tool_result_written_far_from_its_declaration_is_pruned():
+    """The third recurrence: the ids all matched, the *order* was fatal."""
+    safe = sanitize_history(_live_interleaved_poison())
+
+    assert _gateway_violations(safe) == [], "the sanitizer must not be able to trigger the 400"
+
+    declared = next(message for message in safe if message["role"] == "assistant")
+    assert "tool_calls" not in declared, "the stranded declaration is the one with no adjacent answer"
+    assert "Lolicon" in declared["content"], "the model's own words are kept"
+
+    # the group at row 881 keeps both calls: dropping the interposed row restores its answers
+    answered = {message["tool_call_id"] for message in safe if message["role"] == "tool"}
+    assert answered == {"call_00_MO1F", "call_00_GIml", "call_00_dQOP", "call_01_kRnc"}
+    assert not any("timeout" in str(message.get("content")) for message in safe), "the stray row goes too"
+
+
+def test_the_budget_boundary_cannot_split_a_declaration_from_its_answers():
+    """The trim cuts from the oldest end, so it can land *inside* a tool_call group."""
+    big = "x" * 4_000
+    messages = [
+        {"role": "system", "content": "contract"},
+        {"role": "user", "content": "older " + big},
+        {"role": "assistant", "content": "two calls", "tool_calls": [_call("a"), _call("b")]},
+        {"role": "tool", "tool_call_id": "a", "name": "exec.run", "content": big},
+        {"role": "tool", "tool_call_id": "b", "name": "exec.run", "content": big},
+        {"role": "user", "content": "newest " + big},
+    ]
+
+    for budget in range(400, 14_001, 200):
+        safe = sanitize_history(messages, max_chars=budget)
+        assert _gateway_violations(safe) == [], f"budget={budget} left a half-cut tool_call group"
+        assert safe[-1]["content"].startswith("newest "), "the turn being sent always survives"
+
