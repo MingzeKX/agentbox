@@ -275,6 +275,52 @@ def test_custom_prompt_is_a_silent_no_op_when_missing_or_empty(tmp_path, monkeyp
     assert load_system_prompt("s-custom") == baseline
 
 
+def test_prompt_mode_custom_only_drops_the_builtin_text_layers(tmp_path, monkeypatch):
+    """AGENT_PROMPT_MODE=custom_only: only the operator's own file, plus the runtime
+    facts -- which stay even here, because they carry the tool list the model needs."""
+    custom = tmp_path / "custom.md"
+    marker = "只用我这一份提示词：回答一律以 ONLY-MARKER 收尾。"
+    custom.write_text(marker + "\n", encoding="utf-8")
+    monkeypatch.setattr(settings, "custom_prompt_file", str(custom))
+    monkeypatch.setattr(settings, "prompt_mode", "custom_only")
+
+    prompt = load_system_prompt("s-only", extra="Sandbox tools: search_tools, call_tool.")
+
+    assert marker in prompt
+    # the runtime facts survive the cut -- without them the model cannot call tools
+    assert "# Runtime" in prompt
+    assert "s-only" in prompt
+    assert "Sandbox tools: search_tools, call_tool." in prompt
+    # the built-in text layers really are gone: no base prompt, no persona, no operating tail
+    assert "You are an autonomous engineering agent." not in prompt
+    assert "# Persona: " not in prompt
+    assert "# 授权、诚实与拒绝纪律" not in prompt
+    # and the runtime facts still come after the operator's words
+    assert prompt.index(marker) < prompt.index("# Runtime")
+
+
+def test_prompt_mode_custom_only_without_usable_file_falls_back_to_full(tmp_path, monkeypatch):
+    """A custom_only slot with no usable file must never yield a person-less prompt:
+    it degrades to exactly the full assembly (and does not raise)."""
+    monkeypatch.setattr(settings, "prompt_mode", "full")
+    monkeypatch.setattr(settings, "custom_prompt_file", str(tmp_path / "missing.md"))
+    full = load_system_prompt("s-only-fallback")
+
+    monkeypatch.setattr(settings, "prompt_mode", "custom_only")
+    fallback = load_system_prompt("s-only-fallback")  # missing file: no raise
+    assert fallback == full
+
+    empty = tmp_path / "empty.md"
+    empty.write_text("\n  \n", encoding="utf-8")
+    monkeypatch.setattr(settings, "custom_prompt_file", str(empty))
+    assert load_system_prompt("s-only-fallback") == full
+
+    binary = tmp_path / "binary.md"
+    binary.write_bytes(b"\xff\xfe\x00 not utf-8")
+    monkeypatch.setattr(settings, "custom_prompt_file", str(binary))
+    assert load_system_prompt("s-only-fallback") == full
+
+
 def test_fs_pull_is_in_the_seeded_core_tools():
     """The prompt tells the model to use fs.pull, so the seed must actually ship it."""
     from agent.ai.pull import PULL_HANDLERS

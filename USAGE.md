@@ -185,6 +185,23 @@ AGENT_CUSTOM_PROMPT_FILE=/opt/agentbox/custom-prompt.md
 * 运行时改路径：`/config custom_prompt_file /opt/agentbox/custom-prompt.md`（立即生效）；
   要重启后仍生效，照上面把它写进 `.env`（这个新键不在控制台自动写回的名单里）。
 
+**只想加载自己这一份提示词（跳过内置文字层）**：
+
+```bash
+# 仓库根 .env（VM 上是 /opt/agentbox/app/.env）
+AGENT_PROMPT_MODE=custom_only
+```
+
+* 此时组装结果是 **`custom` + `runtime`**：`base`、persona、`operating` 三段内置文字
+  **全部跳过**，只有你自己的文件生效（同义词 `only` / `custom-only` / `only_custom` /
+  `仅自定义`，大小写不敏感）。
+* **`runtime`（运行时事实）永远保留**，`custom_only` 下也在：里面是本次会话 id、沙箱工作区、
+  常驻工具清单和当前限制——**没有它模型不会正确调工具**，所以这一层不能省。
+* 安全兜底：`custom_only` 下如果自定义文件**缺失 / 空 / 非 UTF-8 / 读不了**，不会拼出
+  一个空提示词或没有规矩的提示词，而是**自动退回完整组装**并记一条 warning（服务照常）。
+* 运行时切换：`/config prompt_mode custom_only`（改回完整用 `/config prompt_mode full`），
+  立即生效；要重启后仍生效就写进 `.env`（`AGENT_PROMPT_MODE` 在控制台自动写回的名单里）。
+
 ---
 
 ## 5. 语音

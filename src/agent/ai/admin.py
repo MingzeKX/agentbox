@@ -31,6 +31,7 @@ log = logging.getLogger(__name__)
 MUTABLE: dict[str, str] = {
     "persona": "which persona styles the answers (see /persona)",
     "custom_prompt_file": "operator's own prompt file (absolute path, may be outside the repo)",
+    "prompt_mode": "full | custom_only: custom_only loads only the operator's own file (+ runtime facts)",
     "net_enabled": "master switch for the firewalled net.* tools",
     "net_allow_hosts": "comma separated allowlist, *.example.com wildcards, * for all",
     "net_allow_ports": "comma separated ports the firewall lets through",

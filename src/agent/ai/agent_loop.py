@@ -39,6 +39,8 @@ EventSink = Callable[[str, dict[str, Any]], None]
 
 #: last custom-prompt problem already logged, so a broken file logs once, not per request
 _custom_problem_logged: str | None = None
+#: whether the custom_only -> full fallback has already been logged (once, not per request)
+_custom_only_fallback_logged = False
 
 
 @dataclass
@@ -126,6 +128,17 @@ def custom_prompt() -> str:
     return ""
 
 
+def _report_custom_only_fallback() -> None:
+    """Say once that ``custom_only`` had nothing to stand on and full assembly was used."""
+    global _custom_only_fallback_logged
+    if not _custom_only_fallback_logged:
+        _custom_only_fallback_logged = True
+        log.warning(
+            "prompt_mode=custom_only but the custom prompt file is missing/empty/unreadable: "
+            "falling back to the full system prompt"
+        )
+
+
 def load_system_prompt(session_id: str, extra: str | None = None, persona: str | None = None) -> str:
     """Base prompt + persona + operating tail + the operator's custom file + runtime facts.
 
@@ -137,15 +150,29 @@ def load_system_prompt(session_id: str, extra: str | None = None, persona: str |
     (:func:`custom_prompt`, re-read per request) comes last of the text layers, so
     their words outrank persona and built-ins -- but only as text: code-level policy
     still decides, and the provider's policy outranks every layer here.
+
+    ``settings.prompt_mode == "custom_only"`` (``AGENT_PROMPT_MODE``) asks for *only*
+    that own file: base, persona and the operating tail are skipped.  The runtime
+    facts are never skipped, not even then -- they carry the resident tool list and
+    the current limits, without which the model cannot call tools correctly.  If the
+    custom file yields no text, the full assembly is used instead (never a silent
+    empty or person-less prompt) and a warning is logged.
     """
     base = PROMPT_PATH.read_text(encoding="utf-8")
     operating = OPERATING_PATH.read_text(encoding="utf-8")
     facts = [f"Current session id: {session_id}.", "Your sandbox workspace persists for this session."]
     if extra:
         facts.append(extra)
-    return personas.build_system_prompt(
-        base, personas.load(persona), facts, operating=operating, custom=custom_prompt()
-    )
+    custom = custom_prompt()
+    if settings.prompt_mode == "custom_only":
+        if custom:
+            # deliberately no base/persona/operating: the operator asked for their own
+            # text only, plus the runtime facts (tool list + limits) that are never dropped
+            runtime = "# Runtime\n\n" + "\n".join(f"* {line}" for line in facts)
+            return f"# Custom (operator)\n\n{custom}\n\n{runtime}\n"
+        # the operator's slot is broken: keep serving, with the full (person-less-safe) prompt
+        _report_custom_only_fallback()
+    return personas.build_system_prompt(base, personas.load(persona), facts, operating=operating, custom=custom)
 
 
 def _preview(value: Any, limit: int = 400) -> str:

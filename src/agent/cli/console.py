@@ -883,6 +883,8 @@ class SlashConsole:
             # the operator's own prompt file: strongest text layer, hot-reloaded, may live
             # outside the repo so a repo push never overwrites it
             "AGENT_CUSTOM_PROMPT_FILE": values.get("custom_prompt_file") or "",
+            # full vs custom_only (only the operator's own file + runtime facts)
+            "AGENT_PROMPT_MODE": values.get("prompt_mode") or "full",
             # self-written tool imports: without these three the profile silently reverts
             # to strict after a restart
             "AGENT_TOOL_IMPORT_PROFILE": values.get("tool_import_profile") or "strict",

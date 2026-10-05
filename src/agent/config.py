@@ -31,6 +31,10 @@ def project_root() -> Path:
 #: omitted from the request instead of being sent empty.
 EFFORT_OFF_WORDS = frozenset({"", "off", "none", "no", "0", "不思考", "关闭", "default", "clear"})
 
+#: words that select "load only my own prompt file, skip the built-in text layers"
+#: for ``prompt_mode``.  Accepted case-insensitively from .env and /config.
+CUSTOM_ONLY_WORDS = frozenset({"only", "custom-only", "custom_only", "only_custom", "仅自定义"})
+
 #: keys from .env that third-party libraries read straight out of the environment
 ENV_PASSTHROUGH_PREFIXES = ("HF_", "TRANSFORMERS_", "TORCH_", "SENTENCE_")
 ENV_PASSTHROUGH_EXACT = ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY")
@@ -249,6 +253,13 @@ class Settings(BaseSettings):
     # and a missing/unreadable/oversized file only costs this one layer.
     # Empty = <repo>/prompts/custom.md if that file exists, else no custom layer.
     custom_prompt_file: str = ""
+    # "full" (default): base -> persona -> operating -> custom -> runtime facts.
+    # "custom_only": ONLY the operator's own file + the runtime facts; base, persona
+    # and the operating tail are skipped.  The runtime facts are never dropped even
+    # here: the model needs the tool list and the current limits to call tools at all.
+    # Synonyms (only, custom-only, only_custom, 仅自定义) normalise to "custom_only";
+    # an empty/missing/unreadable custom file silently falls back to "full".
+    prompt_mode: Literal["full", "custom_only"] = "full"
 
     net_enabled: bool = False
     # comma separated hosts; "*.example.com" wildcards; a bare "*" allows everything
@@ -279,6 +290,15 @@ class Settings(BaseSettings):
             return v
         word = v.strip().lower()
         return "" if word in EFFORT_OFF_WORDS else word
+
+    @field_validator("prompt_mode", mode="before")
+    @classmethod
+    def _normalise_prompt_mode(cls, v: object) -> object:
+        """Accept the "only my own prompt" synonyms (case-insensitive)."""
+        if not isinstance(v, str):
+            return v
+        word = v.strip().lower()
+        return "custom_only" if word in CUSTOM_ONLY_WORDS else word
 
     @field_validator("embedding_dim")
     @classmethod

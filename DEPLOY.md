@@ -418,6 +418,8 @@ curl.exe -s -o NUL -w "%{http_code}`n" http://127.0.0.1:8090/health
 > `AGENT_CUSTOM_PROMPT_FILE=/opt/agentbox/custom-prompt.md`。**每次请求重新读**（改完下一轮生效，不用重启），
 > 位置在 persona 与内置规则**之后**（`base → persona → operating → custom → runtime`），但同样改不了上面这些服务端开关；
 > 文件缺失/空/非 UTF-8/过大只会被忽略并记一条日志，服务不受影响（细节见 [`USAGE.md`](USAGE.md) §4 末）。
+> 只想加载这一份文件、跳过内置文字层：`.env` 里加 `AGENT_PROMPT_MODE=custom_only`（或运行时 `/config prompt_mode custom_only`），
+> 此时只有 `custom` + `runtime`（运行时事实永远保留，模型靠它拿工具清单）；文件空/缺失则自动退回完整组装并记 warning。
 
 ---
 
