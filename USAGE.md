@@ -142,7 +142,7 @@ powershell -ExecutionPolicy Bypass -File .\deploy\windows\stop-agent.ps1
 | `/voice-mode` | 实时语音：`on` / `hands-free` / `off` / `status` | `/voice-mode on` |
 | `/voice-devices` | 列出麦克风 + `sounddevice`/朗读是否可用（序号可填进 `AGENT_VOICE_INPUT_DEVICE`） | `/voice-devices` |
 | `/speak` | 回答是否朗读（Windows 自带 SAPI，只影响这个终端） | `/speak off` |
-| `/config` | 所有运行时可改项（改完**立即生效并写入 VM 的 `.env`**） | `/config`、`/config tool_extra_modules smtplib` |
+| `/config` | 运行时设置：`/config` 看全部、`/config <键>` 看一项、`/config <键> <值>` 设置（改完**立即生效并写入 VM 的 `.env`**，重启后仍生效） | `/config`、`/config prompt_mode`、`/config prompt_mode custom_only`、`/config tool_extra_modules smtplib` |
 | `/save` | 手动再把当前值同步一次到 VM 的 `.env`（正常不需要） | `/save` |
 | `/sandbox` | 沙箱池状态（VM 列表 / 加速器 / 预热数） | `/sandbox` |
 | `/get` | 把沙箱里 AI 生成的文件/图片取到本机 `var\pulled\`（图片会自动打开） | `/get /workspace/plot.png`、`/get /workspace/out.csv report/a.csv` |

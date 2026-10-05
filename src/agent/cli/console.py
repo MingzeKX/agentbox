@@ -696,9 +696,17 @@ AGENT_VOICE_TTS；这两项不会写进 VM 的 .env（服务端没有喇叭，�
     "clear": """[cyan]/clear[/cyan] [dim]（别名 /cls）[/dim]       清屏：清空这个终端，不改变当前会话
                                  （要开新会话用 /new）""",
     "cls": "参见 [cyan]/help clear[/cyan]。",
-    "config": """[cyan]/config[/cyan]                        所有运行时可改的设置
+    "config": """[cyan]/config[/cyan]                        查看全部运行时可改的设置
+[cyan]/config <键>[/cyan]                   只看这一项（键、当前值、提示）
+[cyan]/config <键> <值>[/cyan]              设置并持久化：立即生效，同时写入 VM 的 .env
+                                 （写好后需重启服务才在重启后保留 ✓ 但现在立刻生效 ✓）
+例：[cyan]/config prompt_mode custom_only[/cyan]
+    [cyan]/config net_enabled on[/cyan]
+    [cyan]/config max_steps 40[/cyan]
 
-改动会立即生效，并立刻写入 VM 的 .env（重启后仍生效）。
+布尔值：true/false、on/off、yes/no、1/0；整数/小数按当前值自动转换。
+键必须来自上面的表（不认识的键会被拒绝，并列出可改的键）。
+持久化失败只是警告：运行时值仍然立即生效，直到服务重启。
 [cyan]/save[/cyan]                          手动再同步一次（正常情况下不需要）""",
     "sandbox": """[cyan]/sandbox[/cyan]                       沙箱池状态：虚拟机、加速器、预热数量
 
@@ -740,7 +748,7 @@ HELP = """
 [cyan]/pip[/cyan]       本会话装包：list / install / persist           [dim](/help pip)[/dim]
 [cyan]/get[/cyan]       把沙箱里 AI 生成的文件/图片取到本机 var\\pulled    [dim](/help get)[/dim]
 [cyan]/archive[/cyan]   AI 的长期存档：列表 / get / rm（不写 .env）      [dim](/help archive)[/dim]
-[cyan]/config[/cyan]    所有运行时可改的设置                          [dim](/help config)[/dim]
+[cyan]/config[/cyan]    运行时设置：查看全部 / 看一项 / 设置并持久化      [dim](/help config)[/dim]
 [cyan]/save[/cyan]      手动把当前值再同步到 VM 的 .env（改设置时已自动写入）
 [cyan]/sandbox[/cyan]   沙箱池状态
 [cyan]/clear[/cyan]     清屏（同义：[cyan]/cls[/cyan]，不改变会话）
@@ -1353,15 +1361,66 @@ class SlashConsole:
 
 
     # --------------------------------------------------------------------- config
-    def _cmd_config(self, args: list[str]) -> None:  # noqa: ARG002
+    @staticmethod
+    def _coerce_setting(current: Any, raw: str) -> Any:
+        """Type the operator's text the way the key already is; the service validates again.
+
+        The console can only send strings, so a boolean key takes on/off/true/false/yes/no/1/0,
+        a numeric key takes a number, and anything else (including an unparsable word, which the
+        AI service rejects verbatim) is passed through as the operator wrote it.
+        """
+        text = raw.strip()
+        if isinstance(current, bool):
+            word = text.lower()
+            if word in {"true", "on", "yes", "1"}:
+                return True
+            if word in {"false", "off", "no", "0"}:
+                return False
+            return raw
+        if isinstance(current, int):
+            try:
+                return int(text)
+            except ValueError:
+                return raw
+        if isinstance(current, float):
+            try:
+                return float(text)
+            except ValueError:
+                return raw
+        return raw
+
+    def _cmd_config(self, args: list[str]) -> None:
+        """``/config`` (table), ``/config <key>`` (one row), ``/config <key> <value>`` (set)."""
         body = self._admin()
-        table = Table(title="运行时设置")
-        table.add_column("配置项", style="cyan")
-        table.add_column("当前值")
-        table.add_column("提示", style="dim")
-        for key, hint in (body.get("mutable") or {}).items():
-            table.add_row(key, str(body["effective"].get(key)), hint)
-        self.console.print(table)
+        mutable = body.get("mutable") or {}
+        effective = body.get("effective") or {}
+        if not args:
+            table = Table(title="运行时设置")
+            table.add_column("配置项", style="cyan")
+            table.add_column("当前值")
+            table.add_column("提示", style="dim")
+            for key, hint in mutable.items():
+                table.add_row(key, str(effective.get(key)), hint)
+            self.console.print(table)
+            return
+
+        key = args[0]
+        if key not in mutable:
+            # never a blind set: an unknown key is named back with the keys that do exist
+            self.err.print(f"[red]未知配置项[/red] {key} — 可改的键： {', '.join(mutable)}")
+            return
+        if len(args) == 1:
+            self.console.print(f"[cyan]{key}[/cyan] = {effective.get(key)}  [dim]{mutable.get(key, '')}[/dim]")
+            return
+
+        before = effective.get(key)
+        value = self._coerce_setting(before, " ".join(args[1:]))
+        # the service coerces/validates and is the only writer, so a rejection changes nothing
+        new_effective, _ = self._apply({key: value})
+        after = new_effective.get(key, value)
+        self.console.print(f"[green]{key}: {before} -> {after}[/green]")
+        if not self._sync_env(new_effective):
+            self.console.print("[yellow]运行时值仍然立即生效，直到服务重启[/yellow]")
 
     def _cmd_save(self, args: list[str]) -> None:  # noqa: ARG002
         """Manual re-sync: write the current settings into the VM's .env over ssh."""

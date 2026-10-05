@@ -49,21 +49,32 @@ class FakeConsole(SlashConsole):
         self.persist_error: str | None = None
         self.values: dict = {
             "persona": "engineer",
+            "custom_prompt_file": "",
+            "prompt_mode": "full",
             "net_enabled": False,
             "net_allow_hosts": "",
             "net_allow_ports": "80,443",
             "net_max_bytes": 8_000_000,
             "net_allow_private_hosts": False,
             "permission_tier": "safe",
+            "max_steps": 24,
+            "exec_default_timeout_s": 60.0,
+            "search_k": 5,
             "llm_model": "deepseek-chat",
             "llm_effort": "",
+            "tool_allow_open": False,
         }
 
     def _admin(self, changes=None):  # noqa: ANN001
         if changes is not None:
             self.calls.append(dict(changes))
             self.values.update(changes)
-        return {"ok": True, "effective": dict(self.values), "applied": [f"{k} -> {v}" for k, v in (changes or {}).items()]}
+        return {
+            "ok": True,
+            "effective": dict(self.values),
+            "applied": [f"{k} -> {v}" for k, v in (changes or {}).items()],
+            "mutable": {k: f"hint for {k}" for k in self.values},
+        }
 
     def _persist(self, keys):  # noqa: ANN001
         if self.persist_error:
@@ -738,6 +749,50 @@ def test_save_still_works_as_a_manual_resync(shell):
     sh.handle("/save")
     assert len(sh.persisted) == 1
     assert "已保存" in output(console)
+
+
+# --------------------------------------------------------------------- /config
+def test_config_shows_one_key_and_sets_with_coercion(shell):
+    sh, console, _ = shell
+    sh.handle("/config")  # no args: the whole table, still read-only
+    out = output(console)
+    assert "运行时设置" in out and "prompt_mode" in out
+    assert sh.calls == [] and sh.persisted == []
+
+    sh.handle("/config prompt_mode")  # one token: just that row
+    assert "prompt_mode = full" in output(console)
+    assert sh.calls == [] and sh.persisted == []
+
+    sh.handle("/config prompt_mode custom_only")
+    assert sh.calls == [{"prompt_mode": "custom_only"}], "exactly one key must be sent"
+    assert "prompt_mode: full -> custom_only" in output(console)
+    assert sh.persisted[-1]["AGENT_PROMPT_MODE"] == "custom_only", "a set persists like /save"
+
+    # the console sends strings; obvious shapes are typed before the service sees them
+    sh.handle("/config net_enabled on")
+    sh.handle("/config tool_allow_open off")
+    sh.handle("/config max_steps 40")
+    sh.handle("/config exec_default_timeout_s 12.5")
+    assert sh.calls[1:] == [
+        {"net_enabled": True},
+        {"tool_allow_open": False},
+        {"max_steps": 40},
+        {"exec_default_timeout_s": 12.5},
+    ]
+
+
+def test_config_refuses_an_unknown_key_and_warns_when_persisting_fails(shell):
+    sh, console, _ = shell
+    sh.handle("/config prompt_mod custom_only")
+    out = output(console)
+    assert "未知配置项" in out and "prompt_mode" in out, "the accepted keys must be named"
+    assert sh.calls == [] and sh.persisted == [], "an unknown key must never be sent"
+
+    sh.persist_error = "缺少 ssh 客户端或 var/vm_key（请改在 VM 内运行）"
+    sh.handle("/config max_steps 40")  # warns, never raises
+    out = output(console)
+    assert "警告" in out and "直到服务重启" in out
+    assert sh.values["max_steps"] == 40, "the runtime value survives the failed write"
 
 
 # ----------------------------------------------------------------- misc commands
