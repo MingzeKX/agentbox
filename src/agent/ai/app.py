@@ -72,6 +72,56 @@ ASR_CONTENT_TYPES = frozenset(
 #: hard cap on one upload (25 MB ~= 13 minutes of 16 kHz mono PCM)
 ASR_MAX_BYTES = 25 * 1024 * 1024
 
+# --------------------------------------------------------------- session turns
+#: ``session_id -> asyncio.Lock``: two turns of the SAME session must not run at the
+#: same time.  Without this, two overlapping ``/chat`` requests interleaved their DB
+#: writes -- e.g. an ``assistant`` row declaring a ``tool_call``, then a ``user`` row,
+#: and the answering ``tool`` row only 12 rows later -- and the gateway rejected that
+#: history with HTTP 400 forever.  Commit ``9363383`` repairs such a history downstream
+#: (a tool_call is answered by the messages that directly follow it); this lock is the
+#: prevention, so the broken shape is never written in the first place.
+_session_locks: dict[str, asyncio.Lock] = {}
+
+#: ``session_id -> how many turns are holding or waiting for that lock``, so the dict
+#: above can drop a lock as soon as the session has no holder and no waiter left.
+_session_turns: dict[str, int] = {}
+
+
+async def _enter_session_turn(session_id: str) -> asyncio.Lock:
+    """Wait for the session's current turn (if any) and take the lock for ours.
+
+    Returns the lock to hand to :func:`_exit_session_turn`.  The lock is per session, so
+    turns of *different* sessions never block each other.
+    """
+    lock = _session_locks.get(session_id)
+    if lock is None:
+        lock = _session_locks[session_id] = asyncio.Lock()
+    _session_turns[session_id] = _session_turns.get(session_id, 0) + 1
+    try:
+        await lock.acquire()
+    except BaseException:
+        # cancelled while queued: we never held it, only our registration is dropped
+        _forget_session_turn(session_id, lock)
+        raise
+    return lock
+
+
+def _exit_session_turn(session_id: str, lock: asyncio.Lock) -> None:
+    """Release the lock taken by :func:`_enter_session_turn` (also on cancellation)."""
+    lock.release()
+    _forget_session_turn(session_id, lock)
+
+
+def _forget_session_turn(session_id: str, lock: asyncio.Lock) -> None:
+    """Drop our registration; forget the lock once nobody holds or waits for it."""
+    left = _session_turns.get(session_id, 1) - 1
+    if left > 0:
+        _session_turns[session_id] = left
+        return
+    _session_turns.pop(session_id, None)
+    if _session_locks.get(session_id) is lock:
+        _session_locks.pop(session_id, None)
+
 
 class ImageIn(BaseModel):
     """One inline image: base64 of the raw bytes plus their media type."""
@@ -497,66 +547,82 @@ def create_app() -> FastAPI:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=exc.status)
 
         session_id = request.session_id or f"s-{uuid.uuid4().hex[:16]}"
-        async with sessionmaker()() as session:
-            await repo.ensure_session(session, session_id, title=request.message[:80])
-            await session.commit()
 
-        extra = await _runtime_facts(gateway())
-        if not request.stream:
-            loop = build_loop(session_id)
-            try:
-                result = await loop.run(content, system_extra=extra)
-            except RpcError as exc:
-                return JSONResponse(
-                    {"ok": False, "session_id": session_id, "error": exc.message, "error_code": exc.label},
-                    status_code=503,
-                )
-            return {
-                "ok": True,
-                "session_id": session_id,
-                "content": result.content,
-                "stop_reason": result.stop_reason,
-                "steps": [step.as_dict() for step in result.steps],
-                "usage": result.usage,
-            }
+        # The whole turn runs under the session's lock: loading history, the agent loop
+        # and persisting the reply.  A concurrent turn of the same session waits here, so
+        # its first write cannot land inside ours (the interleaving that produced the
+        # unreplayable 400 history commit 9363383 had to repair).  Other sessions use
+        # other locks and keep running in parallel.
+        lock = await _enter_session_turn(session_id)
+        # the streaming path hands the lock to its runner task, which releases it in its
+        # own ``finally``; every other exit path releases it below
+        handed_to_runner = False
+        try:
+            async with sessionmaker()() as session:
+                await repo.ensure_session(session, session_id, title=request.message[:80])
+                await session.commit()
 
-        queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
-        sink = lambda kind, payload: queue.put_nowait({"type": kind, **payload})  # noqa: E731
-        loop = build_loop(session_id, on_event=sink, preview_chars=request.preview_chars)
+            extra = await _runtime_facts(gateway())
+            if not request.stream:
+                loop = build_loop(session_id)
+                try:
+                    result = await loop.run(content, system_extra=extra)
+                except RpcError as exc:
+                    return JSONResponse(
+                        {"ok": False, "session_id": session_id, "error": exc.message, "error_code": exc.label},
+                        status_code=503,
+                    )
+                return {
+                    "ok": True,
+                    "session_id": session_id,
+                    "content": result.content,
+                    "stop_reason": result.stop_reason,
+                    "steps": [step.as_dict() for step in result.steps],
+                    "usage": result.usage,
+                }
 
-        async def runner() -> None:
-            try:
-                await loop.run(content, system_extra=extra)
-            except RpcError as exc:
-                queue.put_nowait({"type": "error", "message": exc.message, "error_code": exc.label})
-            except LLMError as exc:
-                queue.put_nowait({"type": "error", "message": str(exc)})
-            except Exception as exc:  # noqa: BLE001 - surface it on the stream
-                log.exception("agent loop crashed")
-                queue.put_nowait({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
-            finally:
-                queue.put_nowait({"type": "_end", "session_id": session_id})
+            queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+            sink = lambda kind, payload: queue.put_nowait({"type": kind, **payload})  # noqa: E731
+            loop = build_loop(session_id, on_event=sink, preview_chars=request.preview_chars)
 
-        task = asyncio.create_task(runner())
+            async def runner() -> None:
+                try:
+                    await loop.run(content, system_extra=extra)
+                except RpcError as exc:
+                    queue.put_nowait({"type": "error", "message": exc.message, "error_code": exc.label})
+                except LLMError as exc:
+                    queue.put_nowait({"type": "error", "message": str(exc)})
+                except Exception as exc:  # noqa: BLE001 - surface it on the stream
+                    log.exception("agent loop crashed")
+                    queue.put_nowait({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
+                finally:
+                    queue.put_nowait({"type": "_end", "session_id": session_id})
+                    _exit_session_turn(session_id, lock)
 
-        async def events():
-            yield f"data: {json.dumps({'type': 'session', 'session_id': session_id})}\n\n"
-            try:
-                while True:
-                    item = await queue.get()
-                    if item is None or item.get("type") == "_end":
-                        break
-                    yield f"data: {json.dumps(item, ensure_ascii=False, default=str)}\n\n"
-            finally:
-                if not task.done():
-                    task.cancel()
-            yield "data: [DONE]\n\n"
+            task = asyncio.create_task(runner())
+            handed_to_runner = True
 
-        return StreamingResponse(
-            events(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
+            async def events():
+                yield f"data: {json.dumps({'type': 'session', 'session_id': session_id})}\n\n"
+                try:
+                    while True:
+                        item = await queue.get()
+                        if item is None or item.get("type") == "_end":
+                            break
+                        yield f"data: {json.dumps(item, ensure_ascii=False, default=str)}\n\n"
+                finally:
+                    if not task.done():
+                        task.cancel()
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(
+                events(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+        finally:
+            if not handed_to_runner:
+                _exit_session_turn(session_id, lock)
 
     # ------------------------------------------------------------------- tools
     @app.get("/tools")
