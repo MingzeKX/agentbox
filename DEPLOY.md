@@ -197,33 +197,79 @@ AGENT_PLATFORM_PORTS=2121,30000-30010,8080,8445
 | 解释器路径 | 安装时勾 *py launcher*，验证 `py -3.14 -V`。**PATH 上的 `python.exe` 可能是 Microsoft Store 别名**（执行返回 9009） | `packaging/README.md`；`packaging/install.ps1:113` |
 | 虚拟化 | **WHPX 需先启用并重启** | `deploy/windows/probe-whpx.ps1`；`.env.example` 里 `AGENT_SANDBOX_ACCEL=auto` 的注释（WHPX 下 guest 不能 `host/max`，否则 `Unexpected VP exit code 4`） |
 | 磁盘 | **≈20 GB 起**（平台 VM + 沙箱镜像 + wheelhouse；`-Fat` 包则是 ~13 GB 的包） | `packaging/README.md` 的"每块东西到底多大"表 |
-| 网络 | 安装期**能联网**（首次要在平台 VM 内构建沙箱镜像 / 下模型） | `packaging/README.md` 的"离线覆盖不到什么"表 |
+| 网络 | 安装期**能联网**（首次装 QEMU、下 Debian 云镜像、在 VM 内构建沙箱镜像、下模型） | `packaging/README.md` 的"离线覆盖不到什么"表；`packaging/setup-agentbox.ps1` 的联网预检 |
 | SSH 客户端 | `ssh.exe`（`start-agent.ps1:85` 找 `%WINDIR%\System32\OpenSSH\ssh.exe`） | `deploy/windows/start-agent.ps1:85` |
-| QEMU | `<仓库>\qemu\` 里有 `qemu-system-x86_64.exe` + `qemu-img.exe`（`-Lean`/`-Fat` 包自带精简版） | `packaging/README.md` 的"首次运行检查清单" |
+| QEMU | **必须自己装**：`-Slim` 包里**不含** `qemu\`（GPLv2 第三方程序，不再随包分发）。官方下载页 <https://www.qemu.org/download/#windows>，安装器默认装到 `C:\Program Files\qemu`；再用 `.env` 的 `AGENT_QEMU_DIR` 或系统 PATH 指给脚本 | `packaging/README.md` 的"QEMU 从哪来"；`packaging/setup-agentbox.ps1` 的 `Resolve-Qemu` |
+
+#### QEMU 装到哪、脚本怎么找到它
+
+1. **自己装 QEMU**（`-Slim` 包不带，也不再随包分发）：官方下载页
+   <https://www.qemu.org/download/#windows>，安装器默认装到 `C:\Program Files\qemu`。
+2. **让脚本找到它，二选一**（两种都实测过）：
+   * **推荐：不改 PATH** —— 在仓库根 `.env` 里写一行
+     `AGENT_QEMU_DIR=C:\Program Files\qemu`（脚本优先用它，不污染系统）；
+   * 或者把 `C:\Program Files\qemu` 加进**系统 PATH**：之后**新开的**终端里
+     `qemu-system-x86_64.exe --version` 能出版本号即可。
+3. **怎么自测**（照抄一条就能判断配好没有）：
+
+   ```powershell
+   qemu-system-x86_64.exe --version                          # PATH 方式
+   & "$env:AGENT_QEMU_DIR\qemu-system-x86_64.exe" --version  # 或直接指定目录
+   ```
+
+4. **常见坑**：
+   * 装好了但**没进 PATH** → 预检/`start-agent` 报"找不到 QEMU" → 用 `AGENT_QEMU_DIR` 一行解决；
+   * `.env` 里的路径**不要加引号**（写 `AGENT_QEMU_DIR=C:\Program Files\qemu`，别写 `"C:\Program Files\qemu"`）；
+   * 装到别处（如 `D:\qemu`）同理，填那个目录即可；
+   * `qemu-img.exe` 必须和 `qemu-system-x86_64.exe` 在**同一个目录**（官方安装包自带）。
+5. 我们**开发机**上的 `<仓库>\qemu\` 目录是历史遗留（`.gitignore` 排除，与 `-Slim` 包无关）。
+   查找顺序三处一致（`setup-agentbox.ps1` / `install.ps1` / `src/agent/config.py:341`）：
+   `AGENT_QEMU_DIR` → `<仓库>\qemu\` → PATH。一个都没有时脚本**只打印安装指引**（含下载页和
+   `AGENT_QEMU_DIR` 选项），不会抛栈。
 
 ### 4.2 解压 → 一键安装
 
 ```powershell
-# ① 源机器（能上网）打包：.\packaging\make-bundle.ps1 -Lean       （README: packaging/README.md）
-# ② 把 dist\agentbox-<版本>-<stamp>-lean.zip 拷到目标机，解压：
-Expand-Archive .\agentbox-0.1.0-<stamp>-lean.zip -DestinationPath C:\agentbox
+# ① 源机器（能上网）打包：.\packaging\make-bundle.ps1 -Slim      （README: packaging/README.md）
+# ② 把 dist\agentbox-<版本>-<stamp>-slim.zip 拷到目标机，解压：
+Expand-Archive .\agentbox-0.1.0-<stamp>-slim.zip -DestinationPath C:\agentbox
 cd C:\agentbox
 
-# ③ 先体检（不改任何东西），再一键装
+# ③ 目标机先装 QEMU，再在 .env 里写 AGENT_QEMU_DIR=C:\Program Files\qemu（见 4.1）
+
+# ④ 先体检（不改任何东西），再一键装
 powershell -ExecutionPolicy Bypass -File .\packaging\setup-agentbox.ps1 -Check
 powershell -ExecutionPolicy Bypass -File .\packaging\setup-agentbox.ps1 -Yes
 ```
+
+第一次跑（不带 `-Check`）会**在平台 VM 里现建沙箱镜像**（`-Slim` 包里没有）：
+`push-repo-to-vm.ps1` → VM 内 `deploy/sandbox/build-sandbox-image.sh` → VM 内 8099 静态服务 →
+`fetch-sandbox-image.ps1` 拉回 `var\sandbox\`。**需要联网，约 5-10 分钟**（debootstrap + apt + pip）。
+
+#### 允许哪个脚本跑（Windows 执行策略与防火墙）
+
+1. **不需要改系统设置（推荐）**：用仓库里的 **`.cmd` 包装** —— `start-agent.cmd`、`stop-agent.cmd`、
+   `fetch-sandbox-image.cmd`、`push-repo-to-vm.cmd`、`vm-console.cmd`、`run-platform-vm.cmd`
+   （它们只在**本次进程**里加 `-ExecutionPolicy Bypass`）。直接敲名字或双击都行。
+2. 或者**显式调用**：`powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy\windows\xxx.ps1`。
+3. 或者**一次性放行**（当前用户，不需要管理员，也不是必须）：
+   `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`。
+   注意：从压缩包解出来的文件可能带"来自网络"标记，先 `Get-ChildItem -Recurse | Unblock-File`。
+4. **防火墙**：首次启动会弹"是否允许 `qemu-system-x86_64.exe` 访问网络" → **允许**
+   （沙箱/WHPX 需要）；拒绝只影响沙箱出网，不影响控制平面。
+5. **别用 `-?` 去验证脚本**：有的脚本会把 `-?` 当参数执行而不是打帮助（我们踩过）。
+   看用法请直接打开 `.ps1` 开头的注释块（`.SYNOPSIS` / `.EXAMPLE`），或不带参数直接跑。
 
 `packaging\setup-agentbox.ps1` 的 8 步（每步幂等，可反复跑）：
 
 | 步 | 做什么 |
 |---|---|
-| 1 | **预检**：Windows / PowerShell 5.1 / Python / 磁盘 / `qemu\` / `var\sandbox\*` / `ssh.exe` / `wheelhouse`，每项给 `✓`/`✗` + 中文修复建议（`-SkipChecks` 可跳） |
+| 1 | **预检**：Windows / PowerShell 5.1 / Python / 磁盘 / **QEMU** / **联网** / `var\sandbox\*` / `ssh.exe` / `wheelhouse`，每项给 `✓`/`✗` + 中文修复建议（`-SkipChecks` 可跳） |
 | 2 | **`.venv` + 依赖**：委托 `packaging\install.ps1`；有 `wheelhouse\` 就 `pip install --no-index --find-links wheelhouse -e .`（**全离线**） |
 | 3 | **`.env`**：生成随机 `AGENT_CONTROL_SECRET`、留 `AGENT_LLM_API_KEY=` 占位，并**强制写入 `AGENT_SANDBOX_CPU=Nehalem`**（不写的话 WHPX 下 guest 用老 CPU 型号，`numpy` 等 x86-64-v2 wheel 会拒绝加载） |
 | 4 | **平台 VM**：已有 qcow2 + `var\vm_key` 就跳过；否则 `fetch-platform-image.ps1` →（有 ISO 且 `-UseIso` 时 `new-platform-vm.ps1`，否则 `provision-cloud-vm.ps1`）→ `run-platform-vm.ps1 -Headless` → 轮询来宾内 `/opt/agentbox/PROVISIONED`；失败会打印 `/var/log/agentbox-install.log` 最后 40 行 |
 | 5 | **模型**：来宾内下 `BAAI/bge-m3` + faster-whisper（`HF_HOME=/opt/agentbox/models`、`HF_ENDPOINT=https://hf-mirror.com`），再重启 `agentbox-ai`（`-SkipModels` 可跳） |
-| 6 | **沙箱镜像**：包里带了就直接用；没带就打印"在平台 VM 里重建"的三条命令 |
+| 6 | **沙箱镜像**：`var\sandbox\` 没有就**自动在平台 VM 里现建**（联网 5-10 分钟，用构建脚本结尾那套 HTTP 发布 + 宿主拉取），有 4 个文件就直接用 |
 | 7 | **启动 + 自检**：`start-agent.ps1 -NoChat` → `:8091/health`、`:8090/health` → `agent.cli sandbox status` 看 `warm=` |
 | 8 | **结论**：成功/失败清单 + `已就绪` / `未就绪`（未就绪时退出码 1） |
 
@@ -237,13 +283,18 @@ powershell -ExecutionPolicy Bypass -File .\packaging\setup-agentbox.ps1 -Yes
 # ④ 唯一必须手工做的一步：把 DeepSeek key 填进仓库根 .env
 notepad .env        # AGENT_LLM_API_KEY=sk-...      （绝不提交、绝不贴出来）
 
-# ⑤ 启动（首次会在平台 VM 内构建沙箱镜像，约 5-10 分钟）
+# ⑤ 启动（`-Slim` 包里没有沙箱镜像：`setup-agentbox.ps1` 第 6 步已在平台 VM 里建好并拉回 var\sandbox\）
 .\start-agent.cmd
 ```
 
 - `.\start-agent.cmd` 就是 `start-agent.ps1` 的包装（见该 `.cmd` 内容）。
-- 首次构建沙箱镜像：来宾内 `sudo /opt/agentbox/app/deploy/sandbox/build-sandbox-image.sh`，产出 `vmlinuz / initrd.img / rootfs.img / workspace-blank.qcow2`（README.md:342），再由 `deploy\windows\fetch-sandbox-image.ps1` 拉回宿主 `var\sandbox\`。
-- 首次构建需要 Debian 镜像源（构建期联网）；构建脚本带 `timeout` + 三镜像回退（README.md:686）。
+- 沙箱镜像 `-Slim` 包里**不带**（里面是 Debian 组件，见 `THIRD-PARTY.md`）：**第一次**跑
+  `setup-agentbox.ps1`（不带 `-Check`）会自动在平台 VM 里用
+  `sudo /opt/agentbox/app/deploy/sandbox/build-sandbox-image.sh` 现建（产出
+  `vmlinuz / initrd.img / rootfs.img / workspace-blank.qcow2`），再用
+  `deploy\windows\fetch-sandbox-image.ps1` 拉回宿主 `var\sandbox\`。
+- 首次构建**需要联网，约 5-10 分钟**（debootstrap + apt + pip，走 Debian 镜像源）；
+  构建脚本带 `timeout` + 三镜像回退（README.md:686）。手动重跑就是上面三条命令。
 - 结论性成功标志：`/opt/agentbox/PROVISIONED` 存在、开始对话前 `agent sandbox status` 里 `warm=` 有值。
 
 ---
@@ -256,7 +307,8 @@ notepad .env        # AGENT_LLM_API_KEY=sk-...      （绝不提交、绝不贴�
 |---|---|---|---|
 | `AGENT_LLM_API_KEY` | `sk-replace-me`（占位，**必须改**） | LLM 网关密钥。**唯一必须手工填的一项** | `.env.example`；`packaging/README.md` |
 | `AGENT_LLM_MODEL` | `deepseek-chat` | 主模型名 | `.env.example` |
-| `AGENT_SANDBOX_CPU` | 空 = 自动（whpx→`qemu64`） | CPU 型号。**`setup-agentbox.ps1` 会强制写成 `Nehalem`**：WHPX 下不能用 `host/max`，且 guest 里的 numpy 等 wheel 需要 SSE4.2 | `packaging/setup-agentbox.ps1:405-410`；`.env.example` |
+| `AGENT_QEMU_DIR` | 空（= 自动找） | QEMU 安装目录。**`-Slim` 包不带 QEMU**，推荐在这里写安装目录（如 `C:\Program Files\qemu`，**不要加引号**）；查找顺序 `AGENT_QEMU_DIR` → `<仓库>\qemu\` → PATH | `packaging/setup-agentbox.ps1` 的 `Resolve-Qemu`；`src/agent/config.py:326-353`；本文 4.1 的"QEMU 装到哪" |
+| `AGENT_SANDBOX_CPU` | 空 = 自动（whpx→`qemu64`） | CPU 型号。**`setup-agentbox.ps1` 会强制写成 `Nehalem`**：WHPX 下不能用 `host/max`，且 guest 里的 numpy 等 wheel 需要 SSE4.2 | `packaging/setup-agentbox.ps1` 的 `Invoke-EnvStep`；`.env.example` |
 | `AGENT_SANDBOX_NET_MODE` | `off` | `off` = 沙箱**不加网卡**；`full` = 加一张 slirp 网卡，**只出网、不进来** | `.env.example`；`src/agent/control/vm.py:207-213` |
 | `AGENT_SANDBOX_WORKSPACE_MB` | 代码默认 `4096`；**构建期脚本默认 `20480`（=20G）** | `/workspace` 盘大小。**开机时自动扩容到磁盘实际大小 ✓**（`agent-init` 里 best-effort 调 `resize2fs`；失败绝不影响启动） | 代码默认 `src/agent/config.py:166`；构建默认 `deploy/sandbox/build-sandbox-image.sh:34`（`WORKSPACE_SIZE_DEFAULT="20480M"`，`.env` 里有值就优先用 `.env`，裸数字按 MB 解释）；扩容 `src/agent/sandbox/init.py:188-216` |
 | `AGENT_TOOL_IMPORT_PROFILE` | `strict` | 自写工具能 import 什么：`strict`（默认）→ `extended`（常用脚本集）→ `unrestricted`（任意模块）。控制台 `/config tool_import_profile` 可改 | `src/agent/config.py:191`；`src/agent/sandbox/checker.py:166-167` |
@@ -330,11 +382,15 @@ curl.exe -s -o NUL -w "%{http_code}`n" http://127.0.0.1:8090/health
 |---|---|
 | `.env`（含 `AGENT_LLM_API_KEY`、`AGENT_CONTROL_SECRET`） | `.gitignore:18`；`packaging/README.md` 的"安全规则"节 |
 | `var\vm_key`（SSH 私钥，以及 `.pub`） | `.gitignore:11`（整个 `var/`）；`make-bundle.ps1` 的"永不进包"清单 |
-| 平台 VM 磁盘 `var\platform\platform.qcow2`（约 10.64 GB） | 只在 `-Fat` 包里可选；默认 `.gitignore:11` + `-Lean` 不含 |
-| 模型权重（来宾 `/opt/agentbox/models`，~4.8 GB） | 在 qcow2 内部，随平台磁盘走；单独不进包 |
-| 沙箱镜像 / 会话 overlay（`*.qcow2`、`*.img`） | `.gitignore:11`（`var/`）、`:22`（`qemu/`）、`:23`（`*.iso`） |
+| **QEMU**（`qemu\`，GPLv2 的第三方程序） | **`-Slim` 包强制排除**（打包时逐文件扫描，出现就中止）；`-Lean`/`-Fat` 才带（内部用）。见 `THIRD-PARTY.md` |
+| 沙箱镜像 `var\sandbox\`（`*.img`、`*.qcow2`、`vmlinuz`、`initrd.img`） | `.gitignore:11`（`var/`）；**`-Slim` 强制排除**（镜像内是 Debian 组件）；`-Lean`/`-Fat` 才带 |
+| 平台 VM 磁盘 `var\platform\platform.qcow2`（约 10.64 GB） | 只在 `-Fat` 包里可选；默认 `.gitignore:11` + `-Slim`/`-Lean` 不含 |
+| Debian 安装 ISO（`*.iso`） | `.gitignore:23`；只在 `-Fat` 包里可选；`-Slim` 强制排除 |
+| 模型权重（来宾 `/opt/agentbox/models`，~4.8 GB） | 在 qcow2 内部，随平台磁盘走；单独不进包（安装时在 VM 内下载） |
 
-`make-bundle.ps1` 还有一层内容级检查：文件内容里出现真实密钥赋值（`AGENT_LLM_API_KEY=sk-…` 之类；占位符放过）会被**跳过并打印文件名**，
+`make-bundle.ps1` 还有两层检查：① `-Slim` 时 payload 里出现 `qemu\`、`qemu*.exe`/`*.dll`、
+`*.img`/`*.qcow2`/`*.iso`/`*.vmdk`/`*.raw` 就**中止打包**（`-ListPayload` 复核也跑同一套规则）；
+② 文件内容里出现真实密钥赋值（`AGENT_LLM_API_KEY=sk-…` 之类；占位符放过）会被**跳过并打印文件名**，
 打完再核一遍 `MANIFEST.sha256` 里不该出现 `.env`/`vm_key`（`packaging/README.md` 的"安全规则"节）。
 
 ### 8.2 沙箱隔离的三条不变量

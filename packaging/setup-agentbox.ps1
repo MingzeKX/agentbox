@@ -1,13 +1,17 @@
 ﻿<#
 .SYNOPSIS
-    agentbox 一键安装：解压 -Lean 包之后，只跑这一个脚本。
+    agentbox 一键安装：解压 -Slim 包（推荐）之后，只跑这一个脚本。
 
 .DESCRIPTION
     把 install.ps1（建 .venv / 装依赖 / 生成 .env）和平台 VM、模型权重、启动自检串成一条线。
     每一步都幂等：重复运行只补缺的那部分。
 
+    这份包（-Slim）里**没有** QEMU、没有镜像、没有模型权重 —— 它们都是第三方的东西
+    （QEMU 是 GPLv2，镜像里是 Debian 组件），由你在这里从公开源取（见 THIRD-PARTY.md）。
+    所以第一次运行**必须联网**：装 QEMU、下 Debian 云镜像、在 VM 里建沙箱镜像、下模型。
+
     顺序：
-      1. 预检（Windows / PowerShell / Python / 磁盘 / qemu\ / 沙箱镜像 / ssh.exe / wheelhouse）
+      1. 预检（Windows / PowerShell / Python / 磁盘 / QEMU / 联网 / 沙箱镜像 / ssh.exe / wheelhouse）
       2. .venv + 依赖（委托 packaging\install.ps1：有 wheelhouse\ 就完全离线）
       3. .env（install.ps1 生成 + 这里补 AGENT_SANDBOX_CPU=Nehalem，否则 guest 里 numpy 拒绝加载）
       4. 平台 VM：没有可用 platform.qcow2 就 fetch-platform-image.ps1 -> provision-cloud-vm.ps1
@@ -15,11 +19,16 @@
          VM 内 /opt/agentbox/PROVISIONED
       5. 模型权重：VM 内下载 BAAI/bge-m3 + faster-whisper（HF_ENDPOINT=hf-mirror.com、
          HF_HUB_DISABLE_XET=1、不使用 download_root=），再修 owner/权限
-      6. 沙箱镜像：随包带了就直接用，没带就给出在 VM 里重建的命令
+      6. 沙箱镜像：var\sandbox\ 里没有就**在平台 VM 里现建**（推仓库 -> 跑
+         deploy/sandbox/build-sandbox-image.sh -> VM 内 8099 静态服务 -> fetch-sandbox-image.ps1
+         拉回宿主）。需要联网，约 5-10 分钟。
       7. 启动 + 自检：start-agent.ps1 -NoChat -> :8091/health、:8090/health -> sandbox status
       8. 成功/失败清单 + 已就绪 / 未就绪
 
-    长任务（下 ISO/云镜像、装 VM、下模型）需要显式同意：-Yes（无人值守）
+    QEMU 从哪来（-Slim 包不带）：AGENT_QEMU_DIR（环境变量或 .env）-> <仓库>\qemu\ -> PATH。
+    一个都找不到就停在预检并打印安装指引（https://www.qemu.org/download/#windows），不会抛栈。
+
+    长任务（下 ISO/云镜像、装 VM、下模型、建沙箱镜像）需要显式同意：-Yes（无人值守）
     或交互式回答 y。非交互环境里不给 -Yes 就会跳过并告诉你要加什么参数。
 
 .EXAMPLE
@@ -90,6 +99,22 @@ function Get-PathSize([string]$p) {
     return [long]$s
 }
 
+# 联网预检：只做一次 TCP 连接（不取数据、不改任何东西），DNS/超时都要能干净地失败。
+function Test-TcpHost([string]$hostName, [int]$port, [int]$timeoutMs = 4000) {
+    $client = $null
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $iar = $client.BeginConnect($hostName, $port, $null, $null)
+        if (-not $iar.AsyncWaitHandle.WaitOne($timeoutMs)) { return $false }
+        $client.EndConnect($iar)
+        return $client.Connected
+    } catch {
+        return $false
+    } finally {
+        if ($client) { $client.Close() }
+    }
+}
+
 function Ask-Yes([string]$what) {
     if ($Yes) { return $true }
     if ($dryRun) { Note ("[DRY-RUN] 会做: " + $what); return $false }
@@ -124,7 +149,6 @@ if ($wheelhouse.StartsWith($RepoRoot, [System.StringComparison]::OrdinalIgnoreCa
     $whRel = $wheelhouse.Substring($RepoRoot.Length).TrimStart('\')
 }
 $qemuDir = Join-Path $RepoRoot 'qemu'
-$qemuExe = Join-Path $qemuDir 'qemu-system-x86_64.exe'
 $sandboxDir = Join-Path $RepoRoot 'var\sandbox'
 $platDir = Join-Path $RepoRoot 'var\platform'
 $platDisk = Join-Path $platDir 'platform.qcow2'
@@ -302,6 +326,44 @@ function Ensure-EnvKey([string]$path, [string]$key, [string]$value) {
     return 'set'
 }
 
+# ==================================================================== QEMU 定位
+# QEMU 是第三方程序（GPLv2），-Slim 包里**不带**，由接收方自己装。查找顺序：
+#   ① AGENT_QEMU_DIR（环境变量，或仓库根 .env 里的一行）→ ② 仓库里的 qemu\ → ③ PATH
+# 顺序和 packaging\install.ps1、src\agent\config.py 的 find_qemu 保持一致。
+$script:Qemu = $null
+function Resolve-Qemu {
+    $cands = New-Object System.Collections.ArrayList
+    $envDir = [Environment]::GetEnvironmentVariable('AGENT_QEMU_DIR')
+    if (-not $envDir) { $envDir = Get-EnvValue $envFile 'AGENT_QEMU_DIR' }
+    if ($envDir) { [void]$cands.Add([pscustomobject]@{ Dir = "$envDir".Trim().Trim('"'); Source = 'AGENT_QEMU_DIR' }) }
+    [void]$cands.Add([pscustomobject]@{ Dir = $qemuDir; Source = '仓库 qemu\' })
+    foreach ($c in $cands) {
+        if (-not $c.Dir) { continue }
+        $exe = Join-Path $c.Dir 'qemu-system-x86_64.exe'
+        if (Test-Path -LiteralPath $exe) {
+            return [pscustomobject]@{ Dir = $c.Dir; Exe = $exe; Img = (Join-Path $c.Dir 'qemu-img.exe'); Source = $c.Source }
+        }
+    }
+    $cmd = Get-Command 'qemu-system-x86_64.exe' -ErrorAction SilentlyContinue
+    if ($cmd) {
+        $d = Split-Path -Parent $cmd.Source
+        return [pscustomobject]@{ Dir = $d; Exe = $cmd.Source; Img = (Join-Path $d 'qemu-img.exe'); Source = 'PATH' }
+    }
+    return $null
+}
+
+# 找不到 QEMU 时的可操作提示（绝不抛栈；-Check 也要能看懂）
+function Show-QemuMissing {
+    Bad 'QEMU: 找不到 qemu-system-x86_64.exe（-Slim 包里不带 QEMU）'
+    Hint '装一份 QEMU for Windows：https://www.qemu.org/download/#windows （安装器默认装到 C:\Program Files\qemu）'
+    Note '三种让 agentbox 找到它的方式（任选一种）：'
+    Note '  ① 推荐（不动系统 PATH）：在仓库根 .env 里加一行  AGENT_QEMU_DIR=C:\Program Files\qemu   —— 路径不要加引号'
+    Note '  ② 把 C:\Program Files\qemu 加进系统 PATH；之后新开的终端里 qemu-system-x86_64.exe --version 能出版本号即可'
+    Note '  ③ 把整个安装目录拷成 <仓库>\qemu\（这个目录在 .gitignore 里，不会被提交/打包）'
+    Note '自测：qemu-system-x86_64.exe --version   或   & "$env:AGENT_QEMU_DIR\qemu-system-x86_64.exe" --version'
+    Note 'QEMU 是 GPLv2 的第三方程序，-Slim 包不随包分发（见 THIRD-PARTY.md），必须自己装。'
+}
+
 # ==================================================================== 1. 预检
 function Invoke-Preflight {
     Step '1/8 预检'
@@ -338,18 +400,36 @@ function Invoke-Preflight {
         else { Bad ("磁盘 {0}: 只剩 {1}" -f $drv, (Format-Size $free)); Hint '至少空出 3 GB；要重建平台 VM 再准备 30 GB。' }
     }
 
-    if (Test-Path -LiteralPath $qemuExe) {
-        $img = Test-Path -LiteralPath (Join-Path $qemuDir 'qemu-img.exe')
-        if ($img) { Ok ("QEMU: $qemuExe（{0}）" -f (Format-Size (Get-PathSize $qemuDir))) }
-        else { Bad 'QEMU: 有 qemu-system-x86_64.exe 但缺 qemu-img.exe'; Hint 'QEMU for Windows 包里两个都要；从 https://qemu.weilnetz.de/w64/ 重新装一份。' }
+    $script:Qemu = Resolve-Qemu
+    if ($script:Qemu) {
+        if (Test-Path -LiteralPath $script:Qemu.Img) {
+            Ok ("QEMU: {0}（来源 {1}，qemu-img.exe 也在；{2}）" -f $script:Qemu.Exe, $script:Qemu.Source, (Format-Size (Get-PathSize $script:Qemu.Dir)))
+        } else {
+            Bad ("QEMU: 有 qemu-system-x86_64.exe 但同目录缺 qemu-img.exe（{0}）" -f $script:Qemu.Dir)
+            Hint 'QEMU for Windows 的安装包自带 qemu-img.exe；从 https://www.qemu.org/download/#windows 重新装一份。'
+        }
     } else {
-        Bad "QEMU: 没有 $qemuExe"
-        Hint 'QEMU 不在 -Lean 之外的包里。到 https://qemu.weilnetz.de/w64/ 装一份，或把 qemu\ 整个目录拷到仓库根，或设 AGENT_QEMU_DIR。'
+        Show-QemuMissing
+    }
+
+    # 联网预检：-Slim 的"没带的那些东西"全都要现场从公开源取，所以先明确说清楚。
+    $netHit = ''
+    foreach ($t in @(@('hf-mirror.com', 443), @('deb.debian.org', 443), @('www.qemu.org', 443))) {
+        if (Test-TcpHost $t[0] $t[1]) { $netHit = ("{0}:{1}" -f $t[0], $t[1]); break }
+    }
+    if ($netHit) { Ok "联网: 能连上 $netHit（首次安装要下云镜像/沙箱镜像的包/模型）" }
+    else {
+        Bad '联网: 连不上 hf-mirror.com:443 / deb.debian.org:443 / www.qemu.org:443'
+        Hint '首次安装必须有网：装 QEMU、下 Debian 云镜像、在平台 VM 里构建沙箱镜像、下模型权重都要联网。'
+        Note '完全离线的目标机：请用 -Fat 包（自带平台磁盘 + ISO），并自己先把 QEMU 装好拷贝过去。'
     }
 
     $sbMissing = @($sandboxNeed | Where-Object { -not (Test-Path -LiteralPath (Join-Path $sandboxDir $_)) })
     if ($sbMissing.Count -eq 0) { Ok ("沙箱镜像: 4 个文件齐全（{0}）" -f (Format-Size (Get-PathSize $sandboxDir))) }
-    else { Bad ("沙箱镜像: var\sandbox\ 缺 " + ($sbMissing -join ', ')); Hint '在平台 VM 里重建：见第 6 步。' }
+    else {
+        Warn ("沙箱镜像: var\sandbox\ 还没有（缺 " + ($sbMissing -join ', ') + '）—— 这是 -Slim 的正常状态')
+        Note '第 6 步会在平台 VM 里用 deploy/sandbox/build-sandbox-image.sh 现建一份（需要联网，约 5-10 分钟），然后自动拉回 var\sandbox\。'
+    }
 
     if (Test-Path -LiteralPath $sshExe) { Ok "ssh.exe: $sshExe" }
     else { Bad 'ssh.exe: 找不到'; Hint '装 Windows 可选功能 "OpenSSH Client"（设置 -> 系统 -> 可选功能）。' }
@@ -424,7 +504,8 @@ function Invoke-PlatformVmStep {
         } else { Ok 'var\vm_key 已存在（值不打印）' }
         return
     }
-    if (-not (Test-Path -LiteralPath $qemuExe)) { Bad '没有 QEMU，没法建平台 VM'; Hint '先把 qemu\ 备好（见第 1 步），再用 -SkipVm=$false 重跑。'; return }
+    if (-not $script:Qemu) { $script:Qemu = Resolve-Qemu }
+    if (-not $script:Qemu) { Show-QemuMissing; return }
 
     $what = '重建平台 VM（下载 Debian 云镜像/fetch + provision，10-40 分钟，需要联网）'
     if (-not (Ask-Yes $what)) { Warn '已跳过平台 VM 重建'; return }
@@ -518,19 +599,86 @@ function Invoke-ModelsStep {
 }
 
 # ==================================================================== 6. 沙箱镜像
+# -Slim 包里不带镜像（里面是 Debian 组件，见 THIRD-PARTY.md），所以第一次安装在这里现建：
+# 推仓库 -> VM 内跑 deploy/sandbox/build-sandbox-image.sh -> VM 内起 8099 静态服务
+# -> 宿主用 fetch-sandbox-image.ps1 拉回 var\sandbox\（这就是构建脚本结尾给的那套步骤）。
 function Invoke-SandboxImageStep {
     Step '6/8 沙箱镜像'
     $missing = @($sandboxNeed | Where-Object { -not (Test-Path -LiteralPath (Join-Path $sandboxDir $_)) })
     if ($missing.Count -eq 0) {
-        Ok ("随包带来的沙箱镜像可用（{0}，4 个文件）" -f (Format-Size (Get-PathSize $sandboxDir)))
+        Ok ("沙箱镜像可用（{0}，4 个文件）" -f (Format-Size (Get-PathSize $sandboxDir)))
         return
     }
-    Warn ("var\sandbox\ 缺: " + ($missing -join ', '))
-    Hint '必须在 Linux 里构建（debootstrap + ext4）。命令：'
-    Note 'powershell -File .\deploy\windows\push-repo-to-vm.ps1'
-    Note 'ssh -i var\vm_key -p 2222 agent@127.0.0.1 "sudo bash /opt/agentbox/app/deploy/sandbox/build-sandbox-image.sh"'
-    Note 'powershell -File .\deploy\windows\fetch-sandbox-image.ps1     # 把 4 个文件拉回 Windows'
-    Note 'start-agent.ps1 也会尝试从 VM 的 8099 端口自动拉一次。'
+    Warn ("var\sandbox\ 还没有（缺 " + ($missing -join ', ') + '）—— 这是 -Slim 的正常状态')
+    Note '镜像里是 Debian 组件，本包不重新分发它，所以要在平台 VM 里现建一份。'
+    Note '构造需要联网，约 5-10 分钟（debootstrap + apt + pip），期间请别关窗口。'
+
+    $what = '在平台 VM 里构建沙箱镜像（5-10 分钟，需要联网）'
+    if (-not (Ask-Yes $what)) {
+        Warn '已跳过沙箱镜像构建（沙箱池会起不来，对话里的沙箱工具不可用）'
+        Note '手动三步（顺序不能换）：'
+        Note '  powershell -File .\deploy\windows\push-repo-to-vm.ps1'
+        Note '  ssh -i var\vm_key -p 2222 agent@127.0.0.1 "sudo bash /opt/agentbox/app/deploy/sandbox/build-sandbox-image.sh"'
+        Note '  powershell -File .\deploy\windows\fetch-sandbox-image.ps1'
+        return
+    }
+    if ($dryRun) {
+        Note '[DRY-RUN] 会：push-repo-to-vm.ps1 -> VM 内 build-sandbox-image.sh -> VM 内起 8099 -> fetch-sandbox-image.ps1'
+        return
+    }
+
+    if (-not $script:Qemu) { $script:Qemu = Resolve-Qemu }
+    if (-not $script:Qemu) { Show-QemuMissing; return }
+    if (-not (Test-Path -LiteralPath $platDisk)) {
+        Bad '没有平台 VM 磁盘（platform.qcow2），建不了沙箱镜像'
+        Hint '先让第 4 步把平台 VM 建出来（本脚本重跑即可），再回来看这一步。'
+        return
+    }
+
+    # 1) 构建是在平台 VM 里做的，所以它得在跑
+    if (-not (Get-PlatformQemuProcess)) {
+        if (Start-PlatformVm) { Note '拉起平台 VM（run-platform-vm.ps1 -Headless）' } else { Bad '缺少 deploy\windows\run-platform-vm.ps1'; return }
+        if (-not (Wait-VmSsh 240)) { Bad '连不上平台 VM 的 SSH，建不了沙箱镜像'; Hint '看 var\platform\console.log；或手动跑 deploy\windows\run-platform-vm.ps1。'; return }
+        Ok '平台 VM 的 SSH 已通'
+    } else { Ok '平台 VM 已在运行' }
+
+    # 2) 把仓库（含构建脚本）推进 VM：VM 里那份是 provisioning 时的快照
+    $push = Join-Path $RepoRoot 'deploy\windows\push-repo-to-vm.ps1'
+    if (Test-Path -LiteralPath $push) {
+        Note '把仓库推送到 VM（保证 VM 里的 build-sandbox-image.sh 就是这份包的版本）'
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $push
+        if ($LASTEXITCODE -ne 0) { Warn ("push-repo-to-vm.ps1 退出码 $LASTEXITCODE —— 继续用 VM 里已有的构建脚本试一次") }
+    } else { Note '没有 push-repo-to-vm.ps1，直接用 VM 里已有的构建脚本' }
+
+    # 3) VM 内构建（debootstrap 慢，给足超时；完整日志留在 VM 里）
+    $buildLog = '/var/log/agentbox-sandbox-image.log'
+    Note "VM 内开始构建：sudo bash /opt/agentbox/app/deploy/sandbox/build-sandbox-image.sh（日志 $buildLog）"
+    $remote = "sudo bash -c 'set -o pipefail; /opt/agentbox/app/deploy/sandbox/build-sandbox-image.sh 2>&1 | tee $buildLog | tail -25'"
+    $r = RunRemote $remote 2400
+    foreach ($line in @($r -split "`r?`n" | Where-Object { "$_".Trim() } | Select-Object -Last 12)) { Note $line }
+    $probe = RunRemote 'ls -1 /var/lib/agentbox/sandbox/vmlinuz /var/lib/agentbox/sandbox/initrd.img /var/lib/agentbox/sandbox/rootfs.img /var/lib/agentbox/sandbox/workspace-blank.qcow2 2>/dev/null | wc -l' 60
+    if ("$probe" -notmatch '(?m)^\s*4\s*$') {
+        Bad '平台 VM 里没有产出 4 个镜像文件'
+        Hint ("看 VM 里的 $buildLog；构建要联网（debootstrap/apt/pip）。确认平台 VM 能访问镜像源后重跑本脚本（幂等）。")
+        return
+    }
+    Ok '沙箱镜像已在平台 VM 里构建完成（4 个文件）'
+
+    # 4) 按构建脚本结尾的说明把镜像发出来，再在宿主拉回 var\sandbox\
+    Note '在 VM 里起临时静态服务（8099），准备把镜像拉回宿主'
+    RunRemote "cd /var/lib/agentbox/sandbox && (pkill -f 'http.server 8099' || true); nohup python3 -m http.server 8099 --bind 0.0.0.0 >/tmp/seed-http.log 2>&1 & sleep 2; ls -1 /var/lib/agentbox/sandbox" 90 | Out-Null
+    $fetch = Join-Path $RepoRoot 'deploy\windows\fetch-sandbox-image.ps1'
+    if (-not (Test-Path -LiteralPath $fetch)) { Bad "缺少 $fetch"; Hint '包不完整，重新解压；或按上面的手动三步自己拉。'; return }
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $fetch
+    if ($LASTEXITCODE -ne 0) {
+        Bad "fetch-sandbox-image.ps1 退出码 $LASTEXITCODE（没能把镜像拉回 var\sandbox\）"
+        Hint '确认平台 VM 的 8099 转发在（run-platform-vm.ps1 自带），然后重跑本脚本（幂等）。'
+        return
+    }
+    $still = @($sandboxNeed | Where-Object { -not (Test-Path -LiteralPath (Join-Path $sandboxDir $_)) })
+    if ($still.Count -gt 0) { Bad ("拉回来了但还是缺: " + ($still -join ', ')); return }
+    Ok ("沙箱镜像已就位（{0}，4 个文件）" -f (Format-Size (Get-PathSize $sandboxDir)))
+    Note '镜像换新之后控制平面要重启才会用上新的（start-agent.ps1 会自己处理）。'
 }
 
 # ==================================================================== 7. 启动 + 自检
@@ -616,6 +764,15 @@ function Invoke-HealthCheck {
         else { Warn 'AGENT_SANDBOX_CPU 是空的（建议 Nehalem）' }
     } else { Bad '没有 .env' }
 
+    if (-not $script:Qemu) { $script:Qemu = Resolve-Qemu }
+    if ($script:Qemu) {
+        $imgTxt = $(if (Test-Path -LiteralPath $script:Qemu.Img) { 'qemu-img.exe 有' } else { 'qemu-img.exe 缺（需要它建 overlay）' })
+        Ok ("QEMU: {0}（来源 {1}；{2}）" -f $script:Qemu.Exe, $script:Qemu.Source, $imgTxt)
+    } else { Show-QemuMissing }
+    $sbLeft = @($sandboxNeed | Where-Object { -not (Test-Path -LiteralPath (Join-Path $sandboxDir $_)) })
+    if ($sbLeft.Count -eq 0) { Ok ("沙箱镜像就位（{0}，4 个文件）" -f (Format-Size (Get-PathSize $sandboxDir))) }
+    else { Warn ("沙箱镜像还没有（缺 " + ($sbLeft -join ', ') + '）—— 不加 -Check 跑一次会在平台 VM 里现建（联网，5-10 分钟）') }
+
     if (Test-Path -LiteralPath $platDisk) { Ok ("平台磁盘存在（{0}）" -f (Format-Size (Get-PathSize $platDisk))) } else { Bad '没有平台磁盘（第 4 步会重建，需要联网 + 10-40 分钟）' }
     if ((Test-Path -LiteralPath $sshKey) -and (Test-Path -LiteralPath "$sshKey.pub")) { Ok 'var\vm_key 存在（值不打印）' } else { Bad 'var\vm_key / var\vm_key.pub 缺失（登录平台 VM 用；私钥不进包）' }
     if (Get-PlatformQemuProcess) { Ok '平台 VM 的 QEMU 正在运行' } else { Warn '平台 VM 没在运行（start-agent.ps1 会拉起它）' }
@@ -630,6 +787,10 @@ function Invoke-HealthCheck {
 }
 
 # ==================================================================== 主流程
+# 被点源（`. .\setup-agentbox.ps1 -RepoRoot <dir>`，单测这么调用）时只定义上面的纯函数，
+# 预检/装 venv/建 VM/建镜像一概不碰。和 deploy\windows\run-platform-vm.ps1 同一个写法。
+if ($MyInvocation.InvocationName -eq '.') { return }
+
 if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot 'pyproject.toml'))) {
     Die "这里不是 agentbox 仓库根目录: $RepoRoot" '用 -File <解压目录>\packaging\setup-agentbox.ps1 运行，或加 -RepoRoot 指定。'
 }

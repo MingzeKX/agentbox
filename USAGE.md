@@ -28,17 +28,25 @@
 
 ---
 
-## 2. 安装（`-Lean` 包，三步）
+## 2. 安装（`-Slim` 包，三步）
 
-拿到的是 `dist\agentbox-*-lean.zip`（旁边有 `.sha256` 可以校验）。**在三步之前先解压**：
+拿到的是 `dist\agentbox-*-slim.zip`（旁边有 `.sha256` 可以校验）。**在三步之前先解压 + 装 QEMU**：
 
 ```powershell
 # 0) 解压到一个没有中文/空格的路径，例如 C:\agentbox
-Expand-Archive .\agentbox-0.1.0-*-lean.zip -DestinationPath C:\agentbox
+Expand-Archive .\agentbox-0.1.0-*-slim.zip -DestinationPath C:\agentbox
 ```
 
+**先装 QEMU**（`-Slim` 包里**不含** QEMU，它是 GPLv2 的第三方程序，见 `THIRD-PARTY.md`）：
+官方下载页 <https://www.qemu.org/download/#windows>，安装器默认装到 `C:\Program Files\qemu`。
+然后**二选一**让脚本找到它：
+
+* **推荐**：在仓库根 `.env` 里写一行 `AGENT_QEMU_DIR=C:\Program Files\qemu`（**不要加引号**）；
+* 或者把 `C:\Program Files\qemu` 加进系统 PATH（新开终端里 `qemu-system-x86_64.exe --version` 能出版本号）。
+
 ```powershell
-# 1) 一件装好：预检 → venv（离线 wheelhouse）→ 生成 .env → 建平台 VM → 下模型 → 自检
+# 1) 一件装好：预检 → venv（离线 wheelhouse）→ 生成 .env → 建平台 VM → 下模型
+#    → **在平台 VM 里现建沙箱镜像**（需要联网，约 5-10 分钟）→ 自检
 cd C:\agentbox
 powershell -ExecutionPolicy Bypass -File .\packaging\setup-agentbox.ps1
 # 只想体检、不动任何东西：加 -Check
@@ -64,8 +72,10 @@ powershell -ExecutionPolicy Bypass -File .\deploy\windows\start-agent.ps1
 | `AGENT_SANDBOX_CPU` | `Nehalem` | WHPX 下必须是有 SSE4.2 的型号，否则 guest 里 numpy 等现代 wheel 直接拒绝加载。`host`/`max` 在 WHPX 上会挂 |
 | `AGENT_SANDBOX_NET_MODE` | `off`（默认）/ `full` | `off` = 沙箱**没有网卡**（最安全）；`full` = 给沙箱网卡（只出不进），`ping`/DNS/`apt-get update` 才能用 |
 
-**离线边界**：Python 本体、QEMU、wheelhouse 都在包里；`var\vm_key`（SSH 私钥）**不会**打进包，
-由 setup 现场生成。平台 VM 的安装期、以及沙箱镜像与模型需要在 VM 内构建/下载时**要联网**。
+**离线边界**：`-Slim` 包里只有**代码 + Python wheel（宽松许可）**；QEMU、沙箱镜像里的 Debian 组件、
+模型权重、Python 本体都由接收方在安装时从公开源自己取（明细见 `THIRD-PARTY.md`）。
+`var\vm_key`（SSH 私钥）**不会**打进包，由 setup 现场生成。平台 VM 的安装期、以及沙箱镜像与模型
+需要在 VM 内构建/下载时**要联网**（首次构建沙箱镜像约 5-10 分钟）。
 
 ---
 

@@ -6,7 +6,7 @@
 
 | 脚本 | 作用 |
 | --- | --- |
-| `make-bundle.ps1` | 在**源机器**上打包：产出 `dist\agentbox-<版本>-<yyyyMMdd-HHmm>[-lean|-fat].zip` + `MANIFEST.sha256` + `SOURCE-COMMIT.txt` |
+| `make-bundle.ps1` | 在**源机器**上打包：产出 `dist\agentbox-<版本>-<yyyyMMdd-HHmm>[-slim|-lean|-fat].zip` + `MANIFEST.sha256` + `SOURCE-COMMIT.txt`. 对外交付用 `-Slim`（不含第三方二进制） |
 | `setup-agentbox.ps1` | 在**目标机器**上的**一键入口**：预检 → 建 `.venv` → 生成 `.env` → 平台 VM → 模型 → 起服务自检 → `已就绪/未就绪` |
 | `install.ps1` | 只做 Windows 侧那一段：建 `.venv`、装依赖（可用 wheelhouse 全离线）、生成 `.env`、体检 |
 
@@ -41,27 +41,37 @@
 ```powershell
 git status                     # 必须干净
 git rev-parse HEAD             # 记下这个 hash
-.\packaging\make-bundle.ps1 -Lean -Force     # 或 -Fat
+.\packaging\make-bundle.ps1 -Slim -Force     # 对外交付（不许带 QEMU/镜像）；内部才用 -Lean/-Fat
+.\packaging\make-bundle.ps1 -Slim -ListPayload   # 只列 payload（只读、不产出 zip），复核用
 # 交验：
 #   1) 包里 SOURCE-COMMIT.txt 的 commit == git rev-parse HEAD
 #   2) 解压副本上 powershell -File .\packaging\install.ps1 -Check 跑通
 ```
 
+---
+
+## 四个预设（`-Slim` 是对外交付的那份）
+
+| 预设 | 命令 | 包里有什么 | 实测 |
+| --- | --- | --- | --- |
+| **代码包** | `.\packaging\make-bundle.ps1` | 源码 + `deploy\` + `packaging\` | 494.9 KB（139 个文件） |
+| **`-Slim`（推荐，可对外分发）** | `.\packaging\make-bundle.ps1 -Slim` | 代码包 + **wheelhouse** + 元数据（`SOURCE-COMMIT.txt` / `MANIFEST.sha256` / `BUNDLE-README.md` / `THIRD-PARTY.md`） | **39.6 MB**（211 个文件；无 QEMU、无镜像） |
+| **`-Lean`（内部）** | `.\packaging\make-bundle.ps1 -Lean` | `-Slim` + **精简 QEMU** + **沙箱镜像** | 1.52 GB（401 个文件） |
+| **`-Fat`（内部全量）** | `.\packaging\make-bundle.ps1 -Fat` | `-Lean` + **平台磁盘 qcow2** + **Debian ISO** | 见"胖包实测" |
+
+`-Slim` 的硬约束（**打包时和 `-ListPayload` 都会失败退出，不是警告**）：payload 里不许出现
+`qemu\`、`qemu*.exe`/`*.dll`、`*.img`/`*.qcow2`/`*.iso`/`*.vmdk`/`*.raw`。所以 `-Slim`
+不能和 `-IncludeQemu`/`-FullQemu`/`-IncludeSandbox`/`-IncludePlatform`/`-IncludeIso`/`-IncludeImages`
+一起用（会直接报错）。理由和第三方清单见仓库根 **`THIRD-PARTY.md`**：
+QEMU 是 GPLv2、镜像里是 Debian 组件，**由接收方在安装时从公开源自己取**，本包不重新分发。
+
+细粒度开关（可单独组合）：`-IncludeWheelhouse`、`-IncludeSandbox`、`-IncludePlatform`、`-IncludeIso`、
+`-IncludeImages`（= 沙箱 + 平台盘 + ISO，旧名字）、`-IncludeQemu`、`-FullQemu`、`-WheelExtras voice,asr`、`-OutDir`、`-Force`、`-ListPayload`。
+
 > `dist\` 里的旧产物（20261004-1650/1651/1658/1701/1706/1707 那几个）是**协议生效前的中途快照**，
 > 已按操作员要求**全部删除**（含 `dist\_staging-*`）。在源码冻结、协议走完之前不会再产出 zip。
 
 ---
-
-## 三个预设（实测数字，2026-10，agentbox 0.1.0）
-
-| 预设 | 命令 | 包里有什么 | 实测 zip |
-| --- | --- | --- | --- |
-| **代码包** | `.\packaging\make-bundle.ps1` | 源码 + `deploy\` + `packaging\` | **494.9 KB**（139 个文件） |
-| **`-Lean`（推荐）** | `.\packaging\make-bundle.ps1 -Lean` | 代码包 + **wheelhouse** + **精简 QEMU** + **沙箱镜像** | **1.52 GB**（401 个文件） |
-| **`-Fat`（全量）** | `.\packaging\make-bundle.ps1 -Fat` | `-Lean` + **平台磁盘 qcow2** + **Debian ISO** | 见下面"胖包实测" |
-
-细粒度开关（可单独组合）：`-IncludeWheelhouse`、`-IncludeSandbox`、`-IncludePlatform`、`-IncludeIso`、
-`-IncludeImages`（= 沙箱 + 平台盘 + ISO，旧名字）、`-IncludeQemu`、`-FullQemu`、`-WheelExtras voice,asr`、`-OutDir`、`-Force`。
 
 ### 每块东西到底多大（本机实测）
 
@@ -70,10 +80,10 @@ git rev-parse HEAD             # 记下这个 hash
 | 源码 + 脚本（`git ls-files`，132 个 tracked 文件） | 1.3 MB | 所有包 |
 | `deploy\` | 174.6 KB | 所有包 |
 | `packaging\`（三个脚本 + 本文档） | 116 KB | 所有包 |
-| `wheelhouse\`（57 个 wheel，含构建后端） | **37.1 MB** | `-Lean` / `-Fat` |
-| QEMU **精简白名单** | **209.7 MB / 201 个文件** | `-Lean` / `-Fat` |
-| QEMU **全量**（`-FullQemu`） | 1,197.8 MB / 3,385 个文件 | 可选 |
-| 沙箱镜像 `var\sandbox\`（4 个文件） | **1.42 GB** | `-Lean` / `-Fat` |
+| `wheelhouse\`（59 个 wheel，含构建后端） | **37.9 MB** | `-Slim` / `-Lean` / `-Fat` |
+| QEMU **精简白名单** | **209.7 MB / 201 个文件** | 只有 `-Lean` / `-Fat`（`-Slim` 强制排除） |
+| QEMU **全量**（`-FullQemu`） | 1,197.8 MB / 3,385 个文件 | 可选（内部） |
+| 沙箱镜像 `var\sandbox\`（4 个文件） | **1.42 GB** | 只有 `-Lean` / `-Fat`（`-Slim` 首次安装时在 VM 里现建） |
 | 平台磁盘 `var\platform\platform.qcow2` | **10.64 GB** | 只有 `-Fat` |
 | Debian 安装 ISO | 756.0 MB | 只有 `-Fat` |
 | VM 内模型 `/opt/agentbox/models`（bge-m3 + whisper） | ~4.8 GB（**在 qcow2 内部**） | 随平台磁盘走 |
@@ -82,6 +92,21 @@ git rev-parse HEAD             # 记下这个 hash
 
 磁盘镜像、ISO、`.whl` 用 *NoCompression* 写进 zip（它们本身已接近不可再压），源码/文档用 *Optimal*，
 所以 zip 体积 ≈ 原体积，压缩只花时间不省空间。
+
+### QEMU 从哪来（`-Slim` 包不带，必须自己装）
+
+* `-Slim` 包里**没有** `qemu\`（GPLv2 的第三方程序，见 `THIRD-PARTY.md`）。自己装：
+  <https://www.qemu.org/download/#windows>，安装器默认装到 `C:\Program Files\qemu`。
+* 让脚本找到它，**二选一**（两种都实测过）：
+  1. **推荐（不动系统 PATH）**：在仓库根 `.env` 里写一行 `AGENT_QEMU_DIR=C:\Program Files\qemu`
+     —— **路径不要加引号**；
+  2. 把 `C:\Program Files\qemu` 加进**系统 PATH**：新开一个终端后 `qemu-system-x86_64.exe --version`
+     能出版本号即可。
+* 查找顺序（`setup-agentbox.ps1` / `install.ps1` / `src\agent\config.py` 三处一致）：
+  `AGENT_QEMU_DIR` -> `<仓库>\qemu\` -> PATH。装到别处（如 `D:\qemu`）同理。
+* 自测：`qemu-system-x86_64.exe --version` 或 `& "$env:AGENT_QEMU_DIR\qemu-system-x86_64.exe" --version`。
+* 开发机上的 `<仓库>\qemu\` 是历史遗留目录，和 `-Slim` 包无关（`.gitignore` 排除，也不会进包）。
+  详细版见 `DEPLOY.md` 的"QEMU 装到哪、脚本怎么找到它"。
 
 ### 精简 QEMU 的白名单规则（这是本仓库自己定的，不是 QEMU 官方）
 
@@ -121,28 +146,37 @@ git rev-parse HEAD             # 记下这个 hash
 | VM 内清缓存后再打：`sudo apt-get clean; .venv/bin/pip cache purge; sudo rm -rf /root/.cache /home/agent/.cache` | 需要自己量（和用过多少有关） |
 | 不需要随包带模型：`rm -rf /opt/agentbox/models`（到目标机器再下，走 hf-mirror） | ~4.8 GB |
 | `qemu-img convert -O qcow2 -c`（zlib 压缩）平台磁盘 | 见下面实测 |
-| 或者干脆别带平台磁盘（用 `-Lean` + `fetch-platform-image.ps1` + `provision-cloud-vm.ps1`） | 10.64 GB |
+| 或者干脆别带平台磁盘（用 `-Slim` + `fetch-platform-image.ps1` + `provision-cloud-vm.ps1`） | 10.64 GB |
 
 ---
 
-## 用法一（推荐）：`-Lean` 包 + 一键脚本
+## 用法一（推荐）：`-Slim` 包 + 一键脚本（先自己装 QEMU）
 
 ```powershell
 # ① 源机器（能上网）
-.\packaging\make-bundle.ps1 -Lean
+.\packaging\make-bundle.ps1 -Slim
 
-# ② 把 dist\agentbox-0.1.0-<stamp>-lean.zip 拷到目标机器
+# ② 把 dist\agentbox-0.1.0-<stamp>-slim.zip 拷到目标机器
 
-Expand-Archive .\agentbox-0.1.0-<stamp>-lean.zip -DestinationPath C:\agentbox
+Expand-Archive .\agentbox-0.1.0-<stamp>-slim.zip -DestinationPath C:\agentbox
 cd C:\agentbox
+
+# ③ 目标机器先装 QEMU（本包不带）：https://www.qemu.org/download/#windows
+#    装完在 .env 里写一行（不要加引号）：AGENT_QEMU_DIR=C:\Program Files\qemu
+#    或者把 C:\Program Files\qemu 加进系统 PATH
+
 powershell -ExecutionPolicy Bypass -File .\packaging\setup-agentbox.ps1 -Check   # 先体检，不改任何东西
 powershell -ExecutionPolicy Bypass -File .\packaging\setup-agentbox.ps1 -Yes     # 一键装（长任务不再问）
 ```
 
+第一次跑（不带 `-Check`）会**在平台 VM 里现建沙箱镜像**：脚本自己跑
+`push-repo-to-vm.ps1` -> VM 内 `deploy/sandbox/build-sandbox-image.sh` -> VM 内 8099 静态服务 ->
+`fetch-sandbox-image.ps1` 把 4 个文件拉回 `var\sandbox\`。**需要联网，约 5-10 分钟**（debootstrap + apt + pip）。
+
 `setup-agentbox.ps1` 的 8 步（每一步幂等，可以反复跑）：
 
-1. **预检**：Windows / PowerShell 5.1 / Python / 磁盘 / `qemu\` / `var\sandbox\*` / `ssh.exe` / `wheelhouse`
-   —— 每项 `✔`/`✘` + 中文修复建议（`-SkipChecks` 可跳过）；
+1. **预检**：Windows / PowerShell 5.1 / Python / 磁盘 / **QEMU（`AGENT_QEMU_DIR` -> `<仓库>\qemu\` -> PATH）** /
+   **联网** / `var\sandbox\*` / `ssh.exe` / `wheelhouse` —— 每项 `✔`/`✘` + 中文修复建议（`-SkipChecks` 可跳过）；
 2. **`.venv` + 依赖**：委托 `install.ps1`，有 `wheelhouse\` 就 `pip install --no-index --find-links wheelhouse -e .`（全离线）；
 3. **`.env`**：生成随机 `AGENT_CONTROL_SECRET`、留 `AGENT_LLM_API_KEY=` 占位，并**强制写入 `AGENT_SANDBOX_CPU=Nehalem`**
    （不写的话 WHPX 下的 guest 用老 CPU 型号，`numpy` 等 x86-64-v2 wheel 会拒绝加载）；
@@ -153,7 +187,8 @@ powershell -ExecutionPolicy Bypass -File .\packaging\setup-agentbox.ps1 -Yes    
 5. **模型**：VM 内下载 `BAAI/bge-m3` + faster-whisper（`HF_HOME=/opt/agentbox/models`、
    `HF_ENDPOINT=https://hf-mirror.com`、**`HF_HUB_DISABLE_XET=1`**、**不传 `download_root=`**），
    再 `chown -R agent:agent` + `chmod -R a+rX`，最后重启 `agentbox-ai`（`-SkipModels` 可跳过）；
-6. **沙箱镜像**：随包带了就直接用；没带就打印在平台 VM 里重建的三条命令；
+6. **沙箱镜像**：`var\sandbox\` 里没有就**自动在平台 VM 里现建**（见上面那条，联网 5-10 分钟），
+   建完自动拉回宿主；已有 4 个文件就直接用；
 7. **启动 + 自检**：`start-agent.ps1 -NoChat` → `:8091/health`、`:8090/health` →
    `agent.cli sandbox status` 看 `warm=`；
 8. **结论**：成功/失败清单 + `已就绪 / 未就绪`（未就绪时退出码 1）。
@@ -183,9 +218,12 @@ powershell -ExecutionPolicy Bypass -File .\packaging\install.ps1          # 建 
    注意 **PATH 上的 `python.exe` 可能是 Microsoft Store 别名**：执行它返回 9009、"什么都没发生"，
    不是真解释器（这台开发机就是这样，只有 `py` 可用）。脚本会识别并提示。
    `pyproject.toml` 实际要求 `>=3.11`，但 **wheelhouse 和解释器版本强绑定**（见下）。
-2. **QEMU**：`<仓库>\qemu\` 里要有 `qemu-system-x86_64.exe` + `qemu-img.exe`。
-   `-Lean`/`-Fat` 包里已经带了精简版（209.7 MB）；代码包里没有，要自己装
-   （<https://qemu.weilnetz.de/w64/>，或从旧机器 `robocopy qemu\ <新>\qemu /E`，或设 `AGENT_QEMU_DIR`）。
+2. **QEMU**：**必须自己装**（`-Slim` 包里**没有** `qemu\`，也不再随包分发）：
+   <https://www.qemu.org/download/#windows>，安装器默认装到 `C:\Program Files\qemu`；
+   然后要么在 `.env` 里写 `AGENT_QEMU_DIR=C:\Program Files\qemu`（不要加引号，推荐），
+   要么把该目录加进系统 PATH。`qemu-system-x86_64.exe` + `qemu-img.exe` 都要在。
+   常见坑：装好了但没进 PATH -> 预检报"找不到 QEMU"，用 `AGENT_QEMU_DIR` 一行解决；
+   装到别处（如 `D:\qemu`）同理。开发机上的 `<仓库>\qemu\` 是历史遗留（`.gitignore` 排除）。
 3. **SSH 密钥**：`var\vm_key` + `var\vm_key.pub`。默认包**不含**（私钥属凭据）。
    如果平台磁盘是从别的机器带过来的，磁盘里的 `authorized_keys` 是**那把**旧公钥，
    必须把配对的私钥带过去，或者按第 4 步重建平台 VM（会生成新密钥）。
@@ -193,9 +231,10 @@ powershell -ExecutionPolicy Bypass -File .\packaging\install.ps1          # 建 
    （cloud-init 装 PostgreSQL/pgvector/python，**安装期需要联网**，10-40 分钟）。
    成功标志：串口日志出现 `agentbox provisioning OK`，VM 内存在 `/opt/agentbox/PROVISIONED`。
    备选是 ISO 安装器路径 `new-platform-vm.ps1`（要 `debian-*-netinst.iso`，只有 `-Fat` 包带）。
-5. **沙箱镜像**：`-Lean` 包里带了 4 个文件；没有的话必须在**平台 VM 里**重建
-   （`deploy/sandbox/build-sandbox-image.sh`，构建期要 Debian mirror），再用
-   `deploy\windows\fetch-sandbox-image.ps1` 拉回来。
+5. **沙箱镜像**：`-Slim` 包里**没有**（里面是 Debian 组件，见 `THIRD-PARTY.md`）；
+   **第一次**跑 `setup-agentbox.ps1` 会自动在**平台 VM 里**现建（`deploy/sandbox/build-sandbox-image.sh`，
+   构建期要 Debian mirror，**联网 5-10 分钟**），再用 `deploy\windows\fetch-sandbox-image.ps1` 拉回
+   `var\sandbox\`。`-Lean`/`-Fat` 包里直接带了 4 个文件，那是内部用法。
 6. **`.env`**：`install.ps1` 已写好随机 `AGENT_CONTROL_SECRET`；**你必须**把 DeepSeek key 填进
    `AGENT_LLM_API_KEY=`（唯一必须手工做的一步）。
 7. **启动**：`powershell -ExecutionPolicy Bypass -File .\deploy\windows\start-agent.ps1`
@@ -208,23 +247,23 @@ powershell -ExecutionPolicy Bypass -File .\packaging\install.ps1          # 建 
 | 东西 | 为什么覆盖不到 | 怎么办 |
 | --- | --- | --- |
 | Python 解释器本身 | 包里只有 wheel，没有 CPython 安装程序 | 自己装 3.13/3.14 x64（和 wheelhouse 版本对齐） |
-| QEMU（代码包里） | 1.17 GB 全量太大；`-Lean` 带的是精简版 210 MB | 上游安装包 / 旧机器 robocopy / `AGENT_QEMU_DIR` |
-| 平台磁盘 / ISO / 模型权重 | 只有 `-Fat` 才打（+11.4 GB） | 用 `-Fat`，或在目标机器上重建 + 重下 |
+| **QEMU** | 它是 GPLv2 的第三方程序，`-Slim` **有意不带**（见 `THIRD-PARTY.md`） | 自己装 <https://www.qemu.org/download/#windows>，再用 `AGENT_QEMU_DIR` 或 PATH 指给脚本 |
+| 平台磁盘 / ISO | 只有 `-Fat` 才打（+11.4 GB，内部包） | 用 `-Fat`，或在目标机器上重建（要联网） |
 | 平台 VM 的**安装期联网** | apt + pip 必须能从镜像源拉包（哪怕只重装一次） | 带了 `platform.qcow2` 就不需要；否则必须有网 |
-| 沙箱镜像的**构建** | ext4 镜像只能在 Linux 里做（debootstrap） | 在平台 VM 里构建一次，之后镜像可离线复用（`-Lean` 已带上） |
+| 沙箱镜像的**构建** | ext4 镜像只能在 Linux 里做（debootstrap）；成品里是 Debian 组件，`-Slim` 不分发 | `setup-agentbox.ps1` 第一次会自动在平台 VM 里建（联网 5-10 分钟），建好之后可离线复用 |
 | VM 内模型权重 | 只在平台磁盘里；或需要 huggingface 镜像 | `-Fat` 间接带；否则在 VM 里下（hf-mirror） |
 | `var\vm_key`（SSH 私钥） | 安全规则强制排除 | 手工从旧机器拷（**不要**放进包里） |
 | wheelhouse 的 Python 版本 | wheel 名里的 `cp3XX` 绑定解释器 minor 版本 + `win_amd64` | 见下一节，按目标机器的版本重新生成 |
 
-一句话：**这个包覆盖"代码 + Python 依赖 + 沙箱镜像 +（可选）QEMU +（可选）平台磁盘"，
-覆盖不了操作系统级的东西（Python、QEMU、私钥）和必须在 VM 内构建/下载的东西。**
+一句话：**`-Slim` 包覆盖"代码 + Python 依赖 + 安装脚本"，QEMU、镜像（Debian 组件）、模型权重、
+Python 本体都由接收方在安装时从公开源自己获取；`-Lean`/`-Fat` 才把 QEMU 和镜像打进去（内部用）。**
 
 ## wheelhouse 和 Python 版本的耦合
 
 本仓库现有的 `packaging\wheelhouse\` 是在 **Python 3.14 / win_amd64** 上下载的
 （wheel 标签是 `cp314` + `cp310-abi3`）。目标机器如果是 **Python 3.13，这批 wheel 装不上**。
 
-* 目标机器也用 3.14 → 直接 `-Lean` 打包，开箱即用；
+* 目标机器也用 3.14 → 直接 `-Slim` 打包，开箱即用；
 * 目标是别的 minor → 在**能上网的源机器**上按目标版本重新下载：
 
   ```powershell
@@ -277,6 +316,11 @@ powershell -ExecutionPolicy Bypass -File .\packaging\install.ps1          # 建 
 
 ## 验证记录（这些数字是跑出来的，不是估的）
 
+* `-Slim` 的 payload（`make-bundle.ps1 -Slim -ListPayload`，**只读**：不建 staging、不产出 zip）：
+  **211 个条目 / 39.6 MB 未压缩**（源码 152 个，含 `packaging\` 的 4 个文件；`wheelhouse\` 59 个 wheel）。
+  逐文件检查确认**没有** `qemu\`、`qemu*.exe`/`*.dll`、`*.img`/`*.qcow2`/`*.iso`/`*.vmdk`/`*.raw`
+  （唯一带 "qemu" 字样的是本仓库自己的 `tests/smoke_qemu_argv.py`，规则刻意放行这类源码文件名）；
+  `-Slim -IncludeQemu` 直接拒绝（退出码 1）。契约测试：`tests\unit\test_slim_bundle_contract.py`。
 * `make-bundle.ps1`（代码包）：139 个文件、494.9 KB；`-Lean`：401 个文件、1.52 GB
   （这两个 zip 是**协议生效前的中途快照，已删除**；下面的行为验证仍然有效，冻结后会重打并复测）。
 * `Expand-Archive -LiteralPath <lean.zip>`：**15-33 秒**，解压后 1,697.8 MB / 401 个文件，

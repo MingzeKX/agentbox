@@ -6,10 +6,21 @@
     文件清单以 `git ls-files` 为准，所以天然不含 var\、.env、.venv\、qemu\、*.iso；
     再补上 deploy\、packaging\install.ps1、BUNDLE-README.md 和 MANIFEST.sha256。
 
-    三个预设（推荐 -Lean）：
-      -Lean  源码 + deploy\ + packaging\ + wheelhouse\ + 精简 QEMU + 沙箱镜像     ≈ 1.7 GB
-      -Fat   -Lean + 平台磁盘 platform.qcow2 + Debian ISO                        ≈ 13 GB
-      （都不给）只打代码包（+ wheelhouse），镜像/QEMU 由对方自己准备
+    四个预设（推荐 -Slim）：
+      -Slim  源码 + deploy\ + packaging\ + wheelhouse\ + 元数据                  ≈ 40 MB
+             **不含任何第三方二进制**：QEMU（GPLv2）和 VM 镜像（Debian 组件）都不进包，
+             由接收方在 setup 时从公开源获取 —— 对外分发用这个（见 THIRD-PARTY.md）
+      -Lean  -Slim + 精简 QEMU（209 MB）+ 沙箱镜像（1.4 GB）                      ≈ 1.7 GB
+      -Fat   -Lean + 平台磁盘 platform.qcow2（10.6 GB）+ Debian ISO（756 MB）     ≈ 13 GB
+      （都不给）只打代码包（+ 元数据），和 -Slim 的区别只是少 wheelhouse
+
+    ⚠ -Lean / -Fat 会把 QEMU（GPLv2）和镜像里的 Debian 组件一起分发出去，只适合内部使用；
+      对外交付请用 -Slim。
+
+    -Slim 的硬约束（列清单或打包时**大声失败**，不是警告）：
+      payload 里不允许出现 qemu\ 目录、任何 qemu*.exe / *.dll、任何
+      *.img / *.qcow2 / *.iso / *.vmdk / *.raw。复核用 -ListPayload：只读、不产出包、
+      也不要求工作树干净（打印这份预设会打成什么，并跑同一套禁用项检查）。
 
     精简 QEMU 白名单（详见 packaging\README.md）：
       保留 根目录全部 *.dll（114 个）+ qemu-system-x86_64.exe / qemu-system-x86_64w.exe /
@@ -39,17 +50,24 @@
       以及任何文件内容里出现"真实"密钥赋值（AGENT_LLM_API_KEY=sk-xxxx…）。
 
 .EXAMPLE
+    powershell -ExecutionPolicy Bypass -File .\packaging\make-bundle.ps1 -Slim
+    powershell -ExecutionPolicy Bypass -File .\packaging\make-bundle.ps1 -Slim -ListPayload  # 只列 payload，不产出包
     powershell -ExecutionPolicy Bypass -File .\packaging\make-bundle.ps1 -Lean
     powershell -ExecutionPolicy Bypass -File .\packaging\make-bundle.ps1 -Fat -OutDir D:\ship
-    powershell -ExecutionPolicy Bypass -File .\packaging\make-bundle.ps1 -Lean -DryRun      # 只复核，不产出 zip
+    powershell -ExecutionPolicy Bypass -File .\packaging\make-bundle.ps1 -Slim -DryRun      # 只复核，不产出 zip
     powershell -ExecutionPolicy Bypass -File .\packaging\make-bundle.ps1 -AllowDirty -DryRun # 看脏树会被记成什么
 #>
 [CmdletBinding()]
 param(
-    # 推荐预设：源码 + wheelhouse + 精简 QEMU + 沙箱镜像（不含平台磁盘/ISO）
+    # 推荐预设：源码 + wheelhouse + 元数据；**不含 QEMU、不含任何镜像**（许可干净，可对外分发）
+    [switch]$Slim,
+    # 内部预设：源码 + wheelhouse + 精简 QEMU + 沙箱镜像（不含平台磁盘/ISO）
     [switch]$Lean,
     # 全量预设：-Lean + 平台磁盘 platform.qcow2 + Debian ISO
     [switch]$Fat,
+    # 只打印这份预设的 payload 清单（每行一个相对路径）+ 跑禁用项检查，然后退出。
+    # 只读：不建 staging、不写 zip、不碰网络、不要求工作树干净。
+    [switch]$ListPayload,
     # --- 以下是细粒度开关，可以单独组合使用 ---
     # 把 packaging\wheelhouse\ 也打进包（离线建 venv 用）
     [switch]$IncludeWheelhouse,
@@ -159,6 +177,53 @@ function Test-ForbiddenContent([string]$full, [string]$rel) {
     return $false
 }
 
+# -Slim 的禁用项：第三方二进制 / VM 镜像。匹配规则刻意收窄，避免误伤自己的源码文件名
+# （例如 tests/smoke_qemu_argv.py 只是文件名里有 qemu，是本仓库的代码，必须放行）。
+$PayloadForbiddenRules = @(
+    @{ Pattern = '(?i)(^|/)qemu(/|$)'; Why = 'qemu\ 目录 / 名为 qemu 的条目（GPLv2 的 QEMU）' }
+    @{ Pattern = '(?i)(^|/)qemu[^/]*\.(exe|dll)$'; Why = 'QEMU 可执行文件或动态库（GPLv2）' }
+    @{ Pattern = '(?i)\.(img|qcow2|iso|vmdk|raw)$'; Why = 'VM 镜像 / 安装盘（内含 Debian 组件）' }
+)
+
+function Get-ForbiddenPayloadEntry([string[]]$rels) {
+    $hits = New-Object System.Collections.ArrayList
+    foreach ($rel in $rels) {
+        $r = ("$rel".Trim() -replace '\\', '/').TrimStart('/')
+        if (-not $r) { continue }
+        foreach ($rule in $PayloadForbiddenRules) {
+            if ($r -match $rule.Pattern) {
+                [void]$hits.Add([pscustomobject]@{ Rel = $r; Why = $rule.Why })
+                break
+            }
+        }
+    }
+    return @($hits)
+}
+
+# -Slim 的硬检查：payload 里出现 QEMU/镜像就中止（不是警告）。$where 说明是哪个阶段发现的。
+function Assert-NoThirdPartyBinaries([string[]]$rels, [string]$where) {
+    $hits = Get-ForbiddenPayloadEntry $rels
+    if ($hits.Count -eq 0) { return }
+    Write-Host ''
+    Write-Host ("✘ ${where}: payload 里有 $($hits.Count) 个禁止条目 —— -Slim 不许带 QEMU / 镜像") -ForegroundColor Red
+    foreach ($h in ($hits | Select-Object -First 30)) { Write-Host ("    " + $h.Rel + "   <- " + $h.Why) -ForegroundColor Red }
+    Die 'payload 违反 -Slim 的许可约束（QEMU 是 GPLv2、镜像里是 Debian 组件）' '去掉 -IncludeQemu / -FullQemu / -IncludeSandbox / -IncludePlatform / -IncludeIso / -IncludeImages；要带这些第三方二进制就用 -Lean / -Fat（仅限内部）'
+}
+
+# 往 payload 清单里加一条（去重；-ListPayload 用）。$srcPath 是绝对源路径：wheelhouse 在包里叫
+# wheelhouse\，在仓库里却是 packaging\wheelhouse\，所以要显式传，别让体积统计变成 0。
+function Add-PayloadEntry([hashtable]$seen, [System.Collections.ArrayList]$list, [string]$rel, [string]$srcPath) {
+    $r = ("$rel".Trim() -replace '\\', '/').TrimStart('/')
+    if (-not $r) { return }
+    $key = $r.ToLowerInvariant()
+    if ($seen.ContainsKey($key)) { return }
+    $seen[$key] = $true
+    if (-not $srcPath) { $srcPath = Join-Path $RepoRoot ($r -replace '/', '\') }
+    $size = [long]0
+    if (Test-Path -LiteralPath $srcPath) { $size = [long](Get-Item -LiteralPath $srcPath -Force).Length }
+    [void]$list.Add([pscustomobject]@{ Rel = $r; Size = $size })
+}
+
 function Resolve-Python {
     $cands = New-Object System.Collections.ArrayList
     $venv = Join-Path $RepoRoot '.venv\Scripts\python.exe'
@@ -201,6 +266,10 @@ print(json.dumps(reqs))
 }
 
 # ------------------------------------------------------------------ 主流程
+# 被点源（`. .\make-bundle.ps1`，单测这么调用）时只定义函数/规则常量，不打包、不写任何文件。
+# 和 deploy\windows\run-platform-vm.ps1 用的是同一个写法。
+if ($MyInvocation.InvocationName -eq '.') { return }
+
 $script:Py = $null
 $script:Staging = $null
 $script:KeepStaging = $false
@@ -214,9 +283,17 @@ try {
     }
 
     # --- 预设展开 --------------------------------------------------------
-    if ($Lean -and $Fat) { Die '-Lean 和 -Fat 只能选一个' '要全量就用 -Fat，要推荐的那份就用 -Lean' }
+    $presets = @()
+    if ($Slim) { $presets += '-Slim' }
+    if ($Lean) { $presets += '-Lean' }
+    if ($Fat) { $presets += '-Fat' }
+    if ($presets.Count -gt 1) { Die ("预设只能选一个，给了: " + ($presets -join ' + ')) '-Slim（对外分发）/ -Lean（内部）/ -Fat（全量）' }
     $preset = 'custom'
-    if ($Lean) {
+    if ($Slim) {
+        $preset = 'slim'
+        $IncludeWheelhouse = $true
+        # 有意为之：slim 不带 QEMU、不带任何镜像。下面还会硬检查一遍。
+    } elseif ($Lean) {
         $preset = 'lean'
         $IncludeWheelhouse = $true
         $IncludeSandbox = $true
@@ -231,11 +308,25 @@ try {
     }
     if ($IncludeImages) { $IncludeSandbox = $true; $IncludePlatform = $true; $IncludeIso = $true }
     if ($FullQemu) { $IncludeQemu = $true }
+    # -Slim 的语义是"包里没有第三方二进制"，所以任何把 QEMU/镜像拉回来的开关都和它冲突：
+    # 宁可现在就大声报错，也不要打出一个带着 GPL/QEMU 的"-Slim"包。
+    if ($preset -eq 'slim') {
+        $conflict = @()
+        if ($IncludeQemu) { $conflict += '-IncludeQemu' }
+        if ($FullQemu) { $conflict += '-FullQemu' }
+        if ($IncludeSandbox) { $conflict += '-IncludeSandbox' }
+        if ($IncludePlatform) { $conflict += '-IncludePlatform' }
+        if ($IncludeIso) { $conflict += '-IncludeIso' }
+        if ($IncludeImages) { $conflict += '-IncludeImages' }
+        if ($conflict.Count -gt 0) {
+            Die ("-Slim 不能和这些开关一起用: " + ($conflict -join ', ')) 'Slim 的卖点就是不带 QEMU/镜像（见 THIRD-PARTY.md）；要带就用 -Lean/-Fat，别用 -Slim'
+        }
+    }
 
     Write-Host ''
     Write-Host '=== agentbox 打包 ===' -ForegroundColor Cyan
     Write-Host "仓库  : $RepoRoot"
-    Write-Host ("预设  : {0}" -f $(if ($preset -eq 'lean') { '-Lean（推荐）' } elseif ($preset -eq 'fat') { '-Fat（全量）' } else { '自定义' }))
+    Write-Host ("预设  : {0}" -f $(if ($preset -eq 'slim') { '-Slim（推荐：不含第三方二进制）' } elseif ($preset -eq 'lean') { '-Lean（内部：带精简 QEMU + 沙箱镜像）' } elseif ($preset -eq 'fat') { '-Fat（全量）' } else { '自定义' }))
 
     # --- 0. git 清单 ---------------------------------------------------
     $git = Get-Command 'git.exe' -ErrorAction SilentlyContinue
@@ -245,6 +336,70 @@ try {
     $tracked = @(& git -C $RepoRoot ls-files)
     if ($LASTEXITCODE -ne 0) { Die 'git ls-files 失败' '检查 .git 是否损坏' }
     if ($tracked.Count -lt 20) { Die "git ls-files 只返回 $($tracked.Count) 个文件，太少" '确认已经 commit 了源码快照（打包只收 tracked 文件）' }
+
+    # --- 0c. -ListPayload：只列 payload + 跑 -Slim 禁用项检查，然后退出 -------
+    # 只读：不建 staging、不产出 zip、不碰网络、也不要求工作树干净（审计 + 契约测试用）。
+    if ($ListPayload) {
+        $lpCommit = "$(& git -C $RepoRoot rev-parse --short HEAD 2>$null)".Trim()
+        $seen = @{}
+        $entries = New-Object System.Collections.ArrayList
+        $groupLines = New-Object System.Collections.ArrayList
+        $noteLines = New-Object System.Collections.ArrayList
+
+        $srcRels = New-Object System.Collections.ArrayList
+        foreach ($rel in $tracked) {
+            $rel = "$rel".Trim()
+            if (-not $rel) { continue }
+            $name = [System.IO.Path]::GetFileName($rel)
+            if (Test-ForbiddenName $name) { continue }
+            if (Test-ForbiddenContent (Join-Path $RepoRoot ($rel -replace '/', '\')) $rel) { continue }
+            [void]$srcRels.Add($rel)
+        }
+        foreach ($rel in $srcRels) { Add-PayloadEntry $seen $entries $rel }
+        [void]$groupLines.Add(("source (git ls-files)  : {0} files" -f $srcRels.Count))
+
+        $pkgRels = @(Get-ChildItem -LiteralPath (Join-Path $RepoRoot 'packaging') -File -ErrorAction SilentlyContinue |
+                     Where-Object { $_.Extension -ieq '.ps1' -or $_.Extension -ieq '.md' } |
+                     ForEach-Object { 'packaging/' + $_.Name })
+        $mark = $entries.Count
+        foreach ($rel in $pkgRels) { Add-PayloadEntry $seen $entries $rel }
+        [void]$groupLines.Add(("packaging\ (ps1 + md)  : {0} files ({1} new)" -f $pkgRels.Count, ($entries.Count - $mark)))
+
+        $whFiles = @(Get-ChildItem -LiteralPath (Join-Path $RepoRoot 'packaging\wheelhouse') -Filter *.whl -File -ErrorAction SilentlyContinue)
+        $mark = $entries.Count
+        foreach ($wf in $whFiles) { Add-PayloadEntry $seen $entries ('wheelhouse/' + $wf.Name) $wf.FullName }
+        [void]$groupLines.Add(("wheelhouse\ (*.whl)    : {0} files ({1} new)" -f $whFiles.Count, ($entries.Count - $mark)))
+
+        # 非 slim 预设：QEMU/镜像是整目录拷贝，这里只给摘要行（-Slim 才是逐文件清单）
+        if ($IncludeQemu) { [void]$noteLines.Add('NOTE: 这个预设会带 qemu\（QEMU for Windows，GPLv2）—— 不是 -Slim，不给逐文件清单') }
+        if ($IncludeSandbox) { [void]$noteLines.Add('NOTE: 这个预设会带 var\sandbox\ 的 4 个镜像文件（~1.4 GB，内含 Debian 组件）') }
+        if ($IncludePlatform) { [void]$noteLines.Add('NOTE: 这个预设会带 var\platform\platform.qcow2（~10.6 GB）') }
+        if ($IncludeIso) { [void]$noteLines.Add('NOTE: 这个预设会带仓库根的 *.iso（Debian 安装盘）') }
+        if (-not $IncludeWheelhouse) { [void]$noteLines.Add('NOTE: 没有 wheelhouse\（安装 .venv 需要联网）') }
+
+        $totalBytes = [long]0
+        foreach ($e in $entries) { $totalBytes += $e.Size }
+
+        Write-Host ''
+        Write-Host '=== payload 清单（-ListPayload：只列，不产出包）===' -ForegroundColor Cyan
+        Write-Host "# preset      : $preset"
+        Write-Host "# repo        : $RepoRoot"
+        Write-Host "# commit      : $lpCommit"
+        Write-Host "# entries     : $($entries.Count)"
+        Write-Host "# total_bytes : $totalBytes"
+        Write-Host "# total_size  : $(Format-Size $totalBytes)"
+        foreach ($g in $groupLines) { Write-Host ("# group " + $g) }
+        foreach ($n in $noteLines) { Write-Host ("# " + $n) }
+        Write-Host '# --- entries below: one relative path per line ---'
+        foreach ($e in ($entries | Sort-Object Rel)) { Write-Host $e.Rel }
+        if ($preset -eq 'slim') {
+            Assert-NoThirdPartyBinaries -rels @($entries | ForEach-Object { $_.Rel }) -where 'payload 清单'
+            Write-Host ("# OK: -Slim payload 共 {0} 个条目，没有 qemu\、没有 *.img/*.qcow2/*.iso/*.vmdk/*.raw" -f $entries.Count)
+        } else {
+            Write-Host ("# 提示: 只有 -Slim 会跑禁用项检查；-{0} 是有意带第三方二进制的内部预设" -f $preset)
+        }
+        exit 0
+    }
 
     # --- 0b. 源码冻结检查（打出来的包必须能对应到一个 commit）-------------
     # 为什么要有这一步：工作树是"活的"，别的代理可能正在改 src/tests。
@@ -452,7 +607,7 @@ try {
         }
         $qemuIncluded = $true
     } else {
-        Write-Host '[5/7] 跳过 QEMU（未指定 -IncludeQemu/-Lean/-Fat）' -ForegroundColor DarkGray
+        Write-Host '[5/7] 跳过 QEMU（-Slim 有意不带；或未指定 -IncludeQemu/-Lean/-Fat）' -ForegroundColor DarkGray
     }
 
     # --- 6. 镜像（可选）---------------------------------------------------
@@ -480,7 +635,7 @@ try {
             Write-Host ("      跳过 var\sandbox\ 里 {0} 项运行期垃圾（sessions/console/smoke/tmp）" -f $sbExtra.Count) -ForegroundColor DarkGray
         }
     } else {
-        Write-Host '      沙箱镜像：未包含' -ForegroundColor DarkGray
+        Write-Host '      沙箱镜像：未包含（镜像里有 Debian 组件，-Slim 有意不带；首次 setup 会在平台 VM 里现建，见 THIRD-PARTY.md）' -ForegroundColor DarkGray
     }
 
     if ($IncludePlatform) {
@@ -514,32 +669,73 @@ try {
         $(if ($sbIncluded) { '已包含' } else { '未包含' }), `
         $(if ($platIncluded) { '已包含' } else { '未包含' }), $isoFound.Count) -ForegroundColor Green
 
+    # --- 6b. -Slim 的硬检查（真的扫一遍 staging，不只是信上面的开关）-------
+    if ($preset -eq 'slim') {
+        $stagedRels = @(Get-ChildItem -LiteralPath $script:Staging -Recurse -Force -File |
+                        ForEach-Object { $_.FullName.Substring($script:Staging.Length + 1) })
+        Assert-NoThirdPartyBinaries -rels $stagedRels -where '打包 staging'
+        if ($stagedRels -notcontains 'THIRD-PARTY.md') {
+            Die 'THIRD-PARTY.md 没进包' '许可说明必须随 -Slim 包一起发出去；确认它已被 git 跟踪（git add THIRD-PARTY.md）'
+        }
+        Write-Host ("[6b/7] -Slim payload 检查通过：{0} 个文件，没有 QEMU 二进制、没有 *.img/*.qcow2/*.iso；THIRD-PARTY.md 在包里" -f $stagedRels.Count) -ForegroundColor Green
+    }
+
     # --- 7. BUNDLE-README + MANIFEST --------------------------------------
     $pyVerText = '(未生成 wheelhouse)'
     if ($script:Py) { $pyVerText = $script:Py.Ver }
     # 下面这些值都在 here-string 外面先算好：here-string 里只用 $var 插值，
     # 避免 $() 里再套 $() 让 Windows PowerShell 5.1 的解析器误判括号。
     $presetText = '自定义'
-    if ($preset -eq 'lean') { $presetText = '-Lean（推荐）' }
+    if ($preset -eq 'slim') { $presetText = '-Slim（推荐：不含第三方二进制）' }
+    elseif ($preset -eq 'lean') { $presetText = '-Lean（内部：带精简 QEMU + 沙箱镜像）' }
     elseif ($preset -eq 'fat') { $presetText = '-Fat（全量）' }
     if ($IncludeWheelhouse) { $whText = "已包含（$($whWhl.Count) 个 wheel，Python $pyVerText，Windows x64）" }
     else { $whText = '未包含（安装 .venv 需要联网）' }
     if ($qemuIncluded) {
         if ($FullQemu) { $qemuText = '已包含（全量）' } else { $qemuText = '已包含（精简白名单）' }
-    } else { $qemuText = '未包含（需要自己准备）' }
-    if ($sbIncluded) { $sbText = '已包含（4 个文件）' } else { $sbText = '未包含（必须在平台 VM 里重建）' }
+    } elseif ($preset -eq 'slim') { $qemuText = '未包含（许可原因，强制排除；接收方自己装，见 THIRD-PARTY.md）' }
+    else { $qemuText = '未包含（需要自己准备）' }
+    if ($sbIncluded) { $sbText = '已包含（4 个文件）' }
+    elseif ($preset -eq 'slim') { $sbText = '未包含（许可原因，强制排除；首次 setup 在平台 VM 里现建，见 THIRD-PARTY.md）' }
+    else { $sbText = '未包含（必须在平台 VM 里重建）' }
     if ($platIncluded) { $platText = '已包含（但私钥要自己带）' } else { $platText = '未包含（按第 1 步重建）' }
-    if ($IncludeWheelhouse) { $whBullet = "* wheelhouse\ —— 离线 pip 依赖（$($whWhl.Count) 个 wheel）" }
+    if ($IncludeWheelhouse) { $whBullet = "* wheelhouse\ —— 离线 pip 依赖（$($whWhl.Count) 个 wheel，全部是 MIT/BSD/Apache 类许可）" }
     else { $whBullet = '* （没有 wheelhouse\：装依赖需要联网）' }
     if ($qemuIncluded) {
         if ($FullQemu) { $qemuBullet = '* qemu\ —— QEMU for Windows（全量）' }
         else { $qemuBullet = '* qemu\ —— QEMU for Windows（精简白名单：x86_64 exe + 全部 DLL + x86 固件）' }
-    } else { $qemuBullet = '* （没有 qemu\：自己准备 QEMU for Windows）' }
-    if ($sbIncluded) { $sbBullet = '* var\sandbox\ —— 沙箱镜像 4 个文件' } else { $sbBullet = '* （没有沙箱镜像：必须在平台 VM 里重建）' }
+    } elseif ($preset -eq 'slim') { $qemuBullet = '* （**没有** qemu\：QEMU 是 GPLv2 的第三方程序，本包不分发；自己从 https://www.qemu.org/download/#windows 装一份）' }
+    else { $qemuBullet = '* （没有 qemu\：自己准备 QEMU for Windows）' }
+    if ($sbIncluded) { $sbBullet = '* var\sandbox\ —— 沙箱镜像 4 个文件' }
+    elseif ($preset -eq 'slim') { $sbBullet = '* （**没有**沙箱镜像：内含 Debian 组件，本包不分发；第一次 setup 会在平台 VM 里现建，需要联网，约 5-10 分钟）' }
+    else { $sbBullet = '* （没有沙箱镜像：必须在平台 VM 里重建）' }
     if ($platIncluded) { $platBullet = '* var\platform\platform.qcow2 —— 平台磁盘（含 VM 内模型权重）' } else { $platBullet = '* （没有平台磁盘：按第 1 步重建）' }
     if ($isoFound.Count -gt 0) { $isoBullet = '* ' + (($isoFound | ForEach-Object { $_.Name }) -join ', ') + ' —— Debian 安装 ISO' }
     else { $isoBullet = '* （没有 ISO）' }
     if ($platIncluded) { $modelsText = '带了磁盘 = 间接带了权重' } else { $modelsText = '没带磁盘 = 权重按第 2 步自己下' }
+    if ($preset -eq 'slim') {
+        $licenceNote = @"
+## 第三方组件：本包不含 QEMU、不含任何镜像、不含模型权重
+
+QEMU（GPLv2）、沙箱/平台镜像里的 Debian 组件、以及模型权重都是**接收方在安装时从公开源自己获取**的，
+本包不重新分发它们 —— 明细和许可见包根目录的 ``THIRD-PARTY.md``。
+
+* QEMU：自己装 <https://www.qemu.org/download/#windows>（默认装到 ``C:\Program Files\qemu``），
+  然后在仓库根的 ``.env`` 里加一行 ``AGENT_QEMU_DIR=C:\Program Files\qemu``（**不要加引号**），
+  或把该目录加进系统 PATH。``setup-agentbox.ps1`` 的查找顺序：``AGENT_QEMU_DIR`` -> ``<仓库>\qemu\`` -> PATH。
+* 沙箱镜像：**第一次**跑 ``setup-agentbox.ps1`` 时脚本会在平台 VM 里用
+  ``deploy/sandbox/build-sandbox-image.sh`` 现建一份（要联网，约 5-10 分钟），然后自动拉回 ``var\sandbox\``。
+
+"@
+    } else {
+        $licenceNote = @"
+## 第三方组件（这个预设带了 GPL/第三方二进制，仅限内部使用）
+
+这个包里有 QEMU（GPLv2）和/或镜像里的 Debian 组件，**不要对外分发**；对外交付请用 ``-Slim``。
+明细见包根目录的 ``THIRD-PARTY.md``。
+
+"@
+    }
     $platNote = ''
     if ($platIncluded) {
         $platNote = @"
@@ -584,7 +780,7 @@ QEMU     : $qemuText
 沙箱镜像 : $sbText
 平台磁盘 : $platText
 
-$platNote## 解压 + 一键安装（照抄即可）
+$licenceNote$platNote## 解压 + 一键安装（照抄即可）
 
     Expand-Archive .\$bundleName.zip -DestinationPath C:\agentbox
     cd C:\agentbox
@@ -651,6 +847,8 @@ $isoBullet
 
 * Python 3.13+ 本体（wheelhouse 里的 wheel 绑定生成时的 Python minor 版本；本包是 $pyVerText）
 * var\vm_key / var\vm_key.pub（SSH 私钥，属凭据，永不进包）
+* QEMU for Windows（GPLv2 的第三方程序；-Slim 不重新分发，自己装，见 THIRD-PARTY.md）
+* 沙箱镜像 / 平台镜像（内含 Debian 组件，-Slim 不重新分发；安装时自己构建/下载）
 * 平台 VM 里的模型权重 /opt/agentbox/models（~4.8 GB，只在 platform.qcow2 内部；本包 $modelsText）
 * 平台 VM 的安装期联网（apt + pip 走镜像源；这一步无法离线，除非你带了 qcow2）
 
@@ -771,7 +969,9 @@ $isoBullet
     $qemuCell = '否（需手工）'
     if ($qemuIncluded) {
         if ($FullQemu) { $qemuCell = '是（全量）' } else { $qemuCell = ('是（精简白名单 {0}）' -f (Format-Size $qemuKeptBytes)) }
-    }
+    } elseif ($preset -eq 'slim') { $qemuCell = '**否（-Slim 强制排除，许可原因）**' }
+    $sbCell = $(if ($sbIncluded) { '是' } else { '否（-IncludeSandbox/-Lean/-Fat）' })
+    if (-not $sbIncluded -and $preset -eq 'slim') { $sbCell = '**否（-Slim 强制排除；首次 setup 在 VM 里现建）**' }
     $whLabel = 'wheelhouse\ (离线 pip 依赖)'
     if ($IncludeWheelhouse) { $whLabel = "wheelhouse\ (离线 pip 依赖, Python $pyVerText)" }
     $rows = @(
@@ -780,7 +980,7 @@ $isoBullet
         [pscustomobject]@{ 项目 = 'packaging\ 安装器 + 一键脚本 + 文档'; 大小 = (Format-Size (Get-PathSize $pkgDst)); 进包 = '是' }
         [pscustomobject]@{ 项目 = $whLabel; 大小 = (Format-Size $whSrcBytes); 进包 = $(if ($IncludeWheelhouse) { '是' } else { '否（-IncludeWheelhouse）' }) }
         [pscustomobject]@{ 项目 = "QEMU for Windows (全部 $([math]::Round($qemuFullBytes/1MB)) MB)"; 大小 = (Format-Size $qemuFullBytes); 进包 = $qemuCell }
-        [pscustomobject]@{ 项目 = '沙箱镜像 var\sandbox\ (4 个文件)'; 大小 = (Format-Size $sbTotal); 进包 = $(if ($sbIncluded) { '是' } else { '否（-IncludeSandbox/-Lean/-Fat）' }) }
+        [pscustomobject]@{ 项目 = '沙箱镜像 var\sandbox\ (4 个文件)'; 大小 = (Format-Size $sbTotal); 进包 = $sbCell }
         [pscustomobject]@{ 项目 = '平台磁盘 var\platform\platform.qcow2'; 大小 = (Format-Size $platBytes); 进包 = $(if ($platIncluded) { '是' } else { '否（-IncludePlatform/-Fat）' }) }
         [pscustomobject]@{ 项目 = 'Debian 安装 ISO'; 大小 = (Format-Size $isoBytes); 进包 = $(if ($isoFound.Count -gt 0) { '是' } else { '否（-IncludeIso/-Fat）' }) }
         [pscustomobject]@{ 项目 = '模型权重 /opt/agentbox/models (~4.8 GB)'; 大小 = '在平台磁盘内'; 进包 = $(if ($platIncluded) { '间接（随 platform.qcow2）' } else { '否' }) }
@@ -797,6 +997,11 @@ $isoBullet
     } else {
         Write-Host '密钥规则：没有 tracked 文件被跳过（.env 本来就不在 git 里）' -ForegroundColor DarkGray
     }
+    if ($preset -eq 'slim') {
+        Write-Host ''
+        Write-Host '-Slim 许可约束（已逐文件扫描 staging）：没有 QEMU 二进制、没有 *.img/*.qcow2/*.iso/*.vmdk/*.raw' -ForegroundColor Green
+        Write-Host '  QEMU / 镜像里的 Debian 组件 / 模型权重都由接收方在 setup 时从公开源获取（包内 THIRD-PARTY.md）' -ForegroundColor DarkGray
+    }
     if ($qemuIncluded -and -not $FullQemu) {
         Write-Host ''
         Write-Host ("精简 QEMU 白名单：保留 {0} 个文件 / {1}；丢弃 {2} 个文件 / {3}" -f `
@@ -811,6 +1016,7 @@ $isoBullet
     Write-Host "  源码   : $describe"
     Write-Host "  commit : $commit"
     Write-Host "  工作树 : $(if ($isDirty) { '脏（-AllowDirty 快照，不对应 commit）' } else { '干净（= git 提交态）' })"
+    if ($preset -eq 'slim') { Write-Host '  许可   : -Slim —— 不含 QEMU / 不含镜像 / 不含模型权重（接收方从公开源获取）' -ForegroundColor Green }
     Write-Host "  SHA256 : $zipHash"
     Write-Host "  校验   : $zipPath.sha256"
     Write-Host ''
