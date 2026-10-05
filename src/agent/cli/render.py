@@ -267,6 +267,13 @@ class StepRenderer:
     #: something of this turn is already on screen, and a blank line was already emitted
     _any_output: bool = False
     _blank_open: bool = False
+    #: called with text that is about to be printed; returns how many sandbox images it
+    #: painted (the console's ``show_inline_images``).  None = no inline images at all.
+    image_hook: Any = None
+    #: images one turn may paint inline; the hook caps each call, this caps the whole turn
+    image_limit: int = 2
+    #: images painted since this turn's ``done`` event (reset there, so the cap is per turn)
+    _inline_images: int = 0
 
     # ------------------------------------------------------------------ history
     def _remember(self, record: ResultRecord) -> None:
@@ -340,6 +347,27 @@ class StepRenderer:
         if "\n" in self._answer_buffer or len(self._answer_buffer) >= ANSWER_FLUSH_CHARS:
             self._flush_answer()
 
+    def _offer_images(self, text: str) -> None:
+        """Offer text that is about to be printed to :attr:`image_hook`, if any.
+
+        The hook (the console) pulls the sandbox images the text mentions and paints them,
+        which is what puts a picture the agent produced straight into the transcript.  A
+        turn stops after ``image_limit`` of them so a directory listing cannot turn the
+        answer into a gallery, and a hook that fails is swallowed: the picture is a bonus,
+        the text is the answer.
+        """
+        if self.image_hook is None or not text or self._inline_images >= self.image_limit:
+            return
+        if self._answer_line_open:
+            # a picture starts on its own line: the answer's partial line is not a canvas
+            self.console.file.write("\n")
+            self.console.file.flush()
+            self._answer_line_open = False
+        try:
+            self._inline_images += int(self.image_hook(text) or 0)
+        except Exception:  # noqa: BLE001 - a picture must never break the turn
+            return
+
     def _flush_answer(self) -> None:
         chunk, self._answer_buffer = self._answer_buffer, ""
         if not chunk:
@@ -353,6 +381,7 @@ class StepRenderer:
         self._answer_started = True
         self._answer_line_open = not body.endswith("\n")
         self._any_output = True
+        self._offer_images(chunk)
 
     def _answer_width(self) -> int:
         """Wrap to the terminal, minus the room the prefix/indent takes up."""
@@ -468,6 +497,8 @@ class StepRenderer:
             status = "[green]ok[/green]" if event.get("ok") else "[red]failed[/red]"
             detail = event.get("preview") or event.get("error") or ""
             self.console.print(f"  [dim]{status} {event.get('duration_ms', 0)}ms[/dim] {detail[:400]}")
+            # the untruncated preview: an image path is usually past the 400 char cut
+            self._offer_images(str(event.get("preview") or ""))
             self._printed()
         elif kind == "error":
             self.finish_answer()
@@ -598,6 +629,8 @@ class StepRenderer:
                 duration_ms=int(duration or 0),
             )
         )
+        # the whole result, not the folded preview: a path below the fold still counts
+        self._offer_images(text)
         self._printed()
 
     def print_full_output(self, back: int = 1) -> bool:
@@ -662,6 +695,8 @@ class StepRenderer:
             used = ", ".join(f"{name}×{count}" for name, count in sorted(self._step_tools.items()))
             self.console.print(Text(f"tools: {used}", style="dim"))
         self._printed()
+        # the turn is over: the next one gets its own inline-image budget
+        self._inline_images = 0
 
     def _summary(self, event: dict[str, Any]) -> str:
         steps = event.get("steps") or []

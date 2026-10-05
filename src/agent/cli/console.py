@@ -158,12 +158,81 @@ GET_OVERWRITE_FLAGS = ("--overwrite", "-f", "--force")
 #: where pulled files land when the control plane does not say (the AI-side default)
 GET_FALLBACK_ROOT = "var\\pulled"
 
+#: how many images one turn may add to the transcript: the reply is the answer, and a wall
+#: of pictures buries it.  The renderer keeps the same per-turn budget (StepRenderer.image_limit).
+INLINE_IMAGE_LIMIT = 2
+#: the widest an inline image may be painted, in columns of half-blocks
+INLINE_IMAGE_COLUMNS = 80
+#: a sandbox image path as it appears in agent/tool text: /workspace only, any of the
+#: extensions ``/get`` knows, case-insensitive.  A path segment is ``\w`` (so a Chinese file
+#: name works) plus the punctuation file names really use, which is what stops prose
+#: punctuation -- ``。``, ``、``, ``,``, ``)``, a backtick -- from being swallowed as part of
+#: the path (the live bug: three images on one line became one absurd path).
+IMAGE_PATH_RE = re.compile(
+    r"/workspace(?:/[\w.~@%+-]+)*?\.(?:png|jpe?g|gif|webp|bmp)\b",
+    re.IGNORECASE,
+)
+
 
 def _control_rpc(method: str, params: dict[str, Any] | None = None, timeout: float = 120.0) -> dict[str, Any]:
     """The control plane's RPC entry point, imported lazily (a test seam and no import cycle)."""
     from agent.cli.main import _control_rpc as call
 
     return call(method, params, timeout)
+
+
+def scan_image_paths(text: str) -> list[str]:
+    """Every distinct ``/workspace`` image path in ``text``, in first-seen order.
+
+    The console prints the agent's answer and every tool result, and either may name a
+    picture the sandbox holds (``saved to /workspace/plot.png``).  The scan is deliberately
+    blind to code fences and prose: a path is a path, and a false positive only costs one
+    "cannot fetch" line.
+    """
+    found: list[str] = []
+    for match in IMAGE_PATH_RE.finditer(str(text or "")):
+        path = match.group(0)
+        if path not in found:
+            found.append(path)
+    return found
+
+
+def render_image_blocks(console: Console, path: Path | str, *, columns: int = INLINE_IMAGE_COLUMNS) -> bool:
+    """Paint the image at ``path`` as coloured half-blocks; False when it cannot be shown.
+
+    Each text row is two pixel rows: ``▀`` takes the upper pixel as its foreground and the
+    lower one as its background, which is the one trick that shows a picture in a plain
+    terminal without any terminal-specific protocol.  The image keeps its aspect ratio,
+    scaled to the console width and never wider than ``columns``.
+
+    Pillow is optional on the host and any failure (no Pillow, not an image, unreadable
+    file) is a ``False`` and no exception: the caller still prints the path line, so the
+    operator keeps the file even when the terminal cannot show it.
+    """
+    try:
+        from PIL import Image
+    except Exception:  # noqa: BLE001 - Pillow is optional on the host
+        return False
+    try:
+        with Image.open(path) as handle:
+            image = handle.convert("RGB")
+            width = max(1, min(int(columns), int(getattr(console, "width", 0) or columns)))
+            rows = max(1, round(width * image.size[1] / max(1, image.size[0]) / 2))
+            image = image.resize((width, rows * 2))
+            pixels = image.load()
+            for y in range(0, rows * 2, 2):
+                line = Text()
+                for x in range(width):
+                    top = pixels[x, y]
+                    bottom = pixels[x, y + 1] if y + 1 < rows * 2 else (0, 0, 0)
+                    line.append(
+                        "▀",
+                        style=f"rgb({top[0]},{top[1]},{top[2]}) on rgb({bottom[0]},{bottom[1]},{bottom[2]})",
+                    )
+                console.print(line)
+    except Exception:  # noqa: BLE001 - a broken image must not break the transcript
+        return False
+    return True
 
 
 def _pip_bytes(size: Any) -> str:
@@ -606,6 +675,8 @@ class SlashConsole:
         self.console = console
         self.err = err_console or console
         self.state = state
+        #: sandbox paths already shown inline, so one picture is pulled once per session
+        self._inline_seen: set[str] = set()
 
     # ------------------------------------------------------------------ transport
     def _headers(self) -> dict[str, str]:
@@ -1181,6 +1252,49 @@ class SlashConsole:
         if dest.startswith("/") or ":" in dest or ".." in dest.split("/"):
             raise RuntimeError(r"目标名只能是 var\pulled 下的相对路径（不允许 .. 或绝对路径）")
 
+        host_path, payload, digest = self._get_pull(path, dest, overwrite=overwrite)
+        self.console.print(
+            f"[green]已保存[/green]: [bold]{host_path}[/bold] ({_pip_bytes(len(payload))}, sha256 {digest})"
+        )
+        self.console.print(f"[dim]落在仓库的 {GET_FALLBACK_ROOT} 下[/dim]")
+        if Path(host_path).suffix.lower() in GET_IMAGE_SUFFIXES:
+            self._open_image(host_path)
+
+    def show_inline_images(self, text: str, *, limit: int = INLINE_IMAGE_LIMIT) -> int:
+        """Pull and paint the sandbox images ``text`` mentions; returns how many were painted.
+
+        This is the hook the renderer calls with text that is about to be printed, so a
+        reply (or a tool result) that names a picture also shows it.  Each path is pulled
+        at most once per session and at most ``limit`` images are painted per call, because
+        the picture is a bonus and the text is the answer.
+        """
+        painted = 0
+        for path in scan_image_paths(text):
+            if painted >= limit:
+                break
+            if path in self._inline_seen:
+                continue
+            self._inline_seen.add(path)
+            name = path.rsplit("/", 1)[-1]
+            try:
+                host_path, payload, _digest = self._get_pull(path, name)
+            except Exception as exc:  # noqa: BLE001 - a picture must never break a turn
+                self.console.print(f"[yellow]图片 {path} 取不回来：{exc}[/yellow]")
+                continue
+            render_image_blocks(self.console, host_path)
+            self.console.print(f"图片: {GET_FALLBACK_ROOT}\\{name} ({len(payload)} 字节)")
+            painted += 1
+        return painted
+
+    def _get_pull(self, path: str, dest: str, *, overwrite: bool = False) -> tuple[str, bytes, str]:
+        """Read ``path`` out of the session sandbox into ``var\\pulled\\<dest>``.
+
+        The console half of ``fs.pull``, shared by ``/get`` and the inline image view: guest
+        ``fs.read`` (binary chunks), then the control plane's ``host.pull.write``, which is
+        also what confines the write to ``var\\pulled`` and enforces the 8 MB pull cap
+        (``AGENT_FS_PULL_MAX_BYTES``) -- the console never decides the destination itself.
+        Returns ``(host path, bytes, sha256)``.
+        """
         session = self._sandbox_session()
         chunks: list[bytes] = []
         digest = hashlib.sha256()
@@ -1238,13 +1352,7 @@ class SlashConsole:
         host_path = str(written.get("path") or "")
         if not host_path:
             raise RuntimeError("控制面没有返回宿主机路径")
-        self.console.print(
-            f"[green]已保存[/green]: [bold]{host_path}[/bold] "
-            f"({_pip_bytes(len(payload))}, sha256 {digest.hexdigest()})"
-        )
-        self.console.print(f"[dim]落在仓库的 {GET_FALLBACK_ROOT} 下[/dim]")
-        if Path(host_path).suffix.lower() in GET_IMAGE_SUFFIXES:
-            self._open_image(host_path)
+        return host_path, payload, digest.hexdigest()
 
     def _open_image(self, host_path: str) -> None:
         """Show the pulled image with the Windows default viewer (best effort)."""

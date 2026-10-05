@@ -38,6 +38,10 @@ err_console = Console(stderr=True, style="bold red")
 #: stream_state key holding the assistant text of the current turn (voice mode speaks it)
 ANSWER_TEXT_KEY = "answer_text"
 
+#: stream_state key holding the console's inline-image hook: text about to be printed in,
+#: how many sandbox pictures were painted out (the renderer calls it, see render.StepRenderer)
+IMAGE_HOOK_KEY = "image_hook"
+
 #: printed when the operator cancelled a turn with Ctrl-C (the console stays alive)
 TURN_CANCELLED = "[dim]已取消这一轮（Ctrl-C）——回到提示符，可以继续输入或再按回车说话[/dim]"
 
@@ -166,6 +170,9 @@ def _render_event(event: dict[str, Any], stream_state: dict[str, Any]) -> None:
     renderer.max_lines = stream_state.get("log_lines", renderer.max_lines)
     renderer.show_args = stream_state.get("show_args", renderer.show_args)
     renderer.fold = stream_state.get("fold", renderer.fold)
+    # the console's inline-image hook: text about to be printed is scanned for sandbox
+    # pictures, which are then pulled and painted right there (None = feature off)
+    renderer.image_hook = stream_state.get(IMAGE_HOOK_KEY)
     renderer.handle(event)
 
 
@@ -313,8 +320,9 @@ def cmd_chat(args: argparse.Namespace) -> int:
         voice_mode=MODE_PUSH_TO_TALK if args.voice else MODE_OFF,
     )
     slash = SlashConsole(console, state, err_console)
-    # one renderer for the whole session: /more needs what earlier turns rendered
-    stream_state: dict[str, Any] = {}
+    # one renderer for the whole session: /more needs what earlier turns rendered.
+    # image_hook is how a reply that names a sandbox picture also shows it in place.
+    stream_state: dict[str, Any] = {IMAGE_HOOK_KEY: slash.show_inline_images}
 
     # Tab completion + history, when prompt_toolkit is available (it is a normal
     # dependency, but the console must still work if the import fails).  The talk key is
